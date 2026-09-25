@@ -1,0 +1,10 @@
+<html>
+<head>
+<script language="JScript">
+var request = new ActiveXObject("MSXML2.XMLHTTP");
+request.open("GET", "https://example.invalid/benign.txt", false);
+request.send();
+document.write(request.responseText);
+</script>
+</head>
+</html>

@@ -1,0 +1,8 @@
+<?XML version="1.0"?>
+<scriptlet>
+  <registration progid="ClickFix.Benign" classid="{00000000-0000-0000-0000-000000000000}">
+    <script language="VBScript">
+      WScript.Echo "benign scriptlet"
+    </script>
+  </registration>
+</scriptlet>

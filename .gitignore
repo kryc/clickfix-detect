@@ -1,0 +1,31 @@
+/target/
+**/fuzz/target/
+**/fuzz/artifacts/
+
+# Rust profiling and coverage
+*.profraw
+*.profdata
+coverage/
+lcov.info
+tarpaulin-report.html
+
+# Logs and local runtime output
+*.log
+*.tmp
+
+# Local environment files
+.env
+.env.*
+!.env.example
+
+# Editor and operating-system files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Rust tool backups
+**/*.rs.bk

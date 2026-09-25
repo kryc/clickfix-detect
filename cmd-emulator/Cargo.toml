@@ -1,0 +1,16 @@
+[package]
+name = "cmd-emulator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+clap.workspace = true
+emulator-core = { path = "../emulator-core" }
+regex.workspace = true
+rustyline.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,19 @@
+[package]
+name = "runbox-emulator"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64.workspace = true
+emulator-core = { path = "../emulator-core" }
+cmd-emulator = { path = "../cmd-emulator" }
+powershell-emulator = { path = "../powershell-emulator" }
+regex.workspace = true
+serde.workspace = true
+thiserror.workspace = true
+windows-script-emulator = { path = "../windows-script-emulator" }
+zip.workspace = true
+
+[lints]
+workspace = true
