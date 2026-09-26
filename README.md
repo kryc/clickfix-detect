@@ -44,6 +44,13 @@ Risk and analysis confidence are separate. Unsupported syntax lowers
 confidence but does not make suspicious evidence disappear or reduce its risk
 score.
 
+Before hashing or emulation, the detector runs an allocation-light candidate
+prefilter over interpreter names, Windows launchers, PowerShell syntax, network
+tools, shell operators, executable/script extensions, and encoding markers.
+Clearly irrelevant clipboard text returns a lightweight Benign report with no
+SHA-256 or trace. Candidate inputs alone are hashed and passed into runbox.
+Inputs larger than 1 MiB are rejected before hashing.
+
 ## Current compatibility tier
 
 - PowerShell: a dedicated span-preserving tokenizer for strings, here-strings,
@@ -354,7 +361,10 @@ public HTTP(S) requests.
 ```rust
 use clickfix_detect::{Detector, DetectorInput};
 
-let report = Detector::default().analyze(DetectorInput::powershell_script(
+let detector = Detector::default();
+let clipboard = "Meeting notes for Friday";
+let prefilter = Detector::prefilter(clipboard);
+let report = detector.analyze(DetectorInput::powershell_script(
     "Write-Output 'safe'",
 ))?;
 println!("{:?}: {}", report.verdict, report.risk.score);
@@ -363,6 +373,12 @@ for url in &report.network_urls {
 }
 # Ok::<(), clickfix_detect::DetectorError>(())
 ```
+
+`AnalysisReport::prefilter` records the decision and matched signals.
+`InputSummary::sha256` is optional and omitted for the definitely-benign fast
+path. Browser clipboard integrations can call
+`clickfix_wasm::prefilter_payload` and invoke full analysis only for a
+`candidate` decision.
 
 Network policy and virtual environment contents are configurable through the
 library APIs:

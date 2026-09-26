@@ -1,4 +1,4 @@
-use clickfix_detect::{Detector, DetectorInput};
+use clickfix_detect::{Detector, DetectorInput, PrefilterDecision};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -37,9 +37,13 @@ struct WasmAnalysis<T> {
 #[wasm_bindgen]
 pub fn analyze_payload(payload: &str, input_kind: &str) -> Result<JsValue, JsValue> {
     let mode = InputMode::parse(input_kind)?;
+    let prefilter = Detector::prefilter(payload);
     let (kind, input) = match mode {
         InputMode::PowerShell => ("powershell", DetectorInput::powershell_script(payload)),
-        InputMode::Auto if looks_like_powershell(payload) => {
+        InputMode::Auto
+            if prefilter.decision == PrefilterDecision::Candidate
+                && looks_like_powershell(payload) =>
+        {
             ("powershell", DetectorInput::powershell_script(payload))
         }
         InputMode::Auto | InputMode::Command => ("command", DetectorInput::raw_command(payload)),
@@ -52,6 +56,18 @@ pub fn analyze_payload(payload: &str, input_kind: &str) -> Result<JsValue, JsVal
         report,
     })
     .map_err(|error| JsValue::from_str(&error.to_string()))
+}
+
+/// Classify clipboard text before full detector analysis.
+///
+/// # Errors
+///
+/// Returns a JavaScript error when the prefilter result cannot be converted to
+/// a JavaScript value.
+#[wasm_bindgen]
+pub fn prefilter_payload(payload: &str) -> Result<JsValue, JsValue> {
+    serde_wasm_bindgen::to_value(&Detector::prefilter(payload))
+        .map_err(|error| JsValue::from_str(&error.to_string()))
 }
 
 #[wasm_bindgen]

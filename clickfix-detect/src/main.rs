@@ -1,6 +1,7 @@
 use clap::{Parser, ValueEnum};
 use clickfix_detect::{
-    render_human, AnalysisReport, Detector, DetectorInput, InputKind, SafeSourcePolicy,
+    render_human, AnalysisReport, Detector, DetectorInput, InputKind, PrefilterDecision,
+    SafeSourcePolicy,
 };
 use emulator_core::{AnalysisLimits, NetworkPolicy};
 use rustyline::{error::ReadlineError, DefaultEditor};
@@ -335,6 +336,9 @@ fn infer_kind(content: &str, path: Option<&PathBuf>) -> InputKind {
             .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
     }) {
         return InputKind::PowerShellScript;
+    }
+    if Detector::prefilter(content).decision == PrefilterDecision::DefinitelyBenign {
+        return InputKind::RawCommand;
     }
     let lowercase = content.to_ascii_lowercase();
     if content.contains('\n')

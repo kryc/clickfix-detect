@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
-use clickfix_detect::{Detector, DetectorInput, Verdict};
+use clickfix_detect::{Detector, DetectorInput, PrefilterDecision, Verdict};
 
 #[derive(Debug, Clone, Copy)]
 enum PublicationCompleteness {
@@ -403,6 +403,12 @@ fn expected_verdict(id: &str) -> Verdict {
 fn published_payloads_are_decoded_without_runtime_rewriting() {
     for case in payloads() {
         let payload = decode_payload(&case);
+        assert_eq!(
+            Detector::prefilter(&payload).decision,
+            PrefilterDecision::Candidate,
+            "{} was missed by the candidate prefilter",
+            case.id
+        );
         let report = Detector::default()
             .analyze(detector_input(&case, &payload))
             .unwrap_or_else(|error| panic!("{} failed analysis: {error}", case.id));
@@ -414,8 +420,8 @@ fn published_payloads_are_decoded_without_runtime_rewriting() {
             case.id
         );
         assert_eq!(
-            report.input.sha256,
-            fixture_sha256(case.id),
+            report.input.sha256.as_deref(),
+            Some(fixture_sha256(case.id)),
             "{} decoded payload changed; verify it against the cited publication and refanging policy before updating the hash",
             case.id
         );

@@ -5,6 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+aho-corasick.workspace = true
 emulator-core = { path = "../emulator-core" }
 runbox-emulator = { path = "../runbox-emulator" }
 serde.workspace = true
