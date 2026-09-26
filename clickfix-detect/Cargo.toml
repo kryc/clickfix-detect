@@ -5,14 +5,16 @@ edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
-clap.workspace = true
 emulator-core = { path = "../emulator-core" }
 runbox-emulator = { path = "../runbox-emulator" }
-rustyline.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 url.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap.workspace = true
+rustyline.workspace = true
 
 [lints]
 workspace = true

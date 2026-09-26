@@ -15,6 +15,7 @@ an explicit bounded public-HTTP(S) opt-in.
 | `windows-script-emulator` | Bounded JScript/VBScript interpreter for WScript, CScript, HTA, scriptlet, and COM behavior |
 | `runbox-emulator` | Windows command dispatch, virtual process recursion, and launcher modeling |
 | `clickfix-detect` | Weighted detection rules, Rust API, human/JSON reports, and the CLI |
+| `clickfix-wasm` | Browser-safe wasm-bindgen wrapper around `clickfix-detect` |
 
 Dependencies flow from `clickfix-detect` to `runbox-emulator`, which dispatches
 to `powershell-emulator`, `cmd-emulator`, and `windows-script-emulator`.
@@ -398,6 +399,19 @@ safe_sources.add_url_prefix("https://downloads.example.com/releases/")?;
 let detector = Detector::default().with_safe_source_policy(safe_sources);
 # Ok::<(), String>(())
 ```
+
+## Browser build
+
+`clickfix-wasm` exposes `analyze_payload(payload, input_kind)` for static,
+client-side applications. The browser target uses the span-preserving
+PowerShell tokenizer rather than the native tree-sitter diagnostic pass, while
+retaining the same emulator and detection logic. Real networking is unavailable
+from this wrapper, so analysis remains local to the page.
+
+The companion Azure Static Web Apps project lives at
+`~/clickfix.kryc.uk`. Its build script compiles this workspace for
+`wasm32-unknown-unknown`, generates wasm-bindgen browser bindings, and bundles
+them with local Bootstrap assets.
 
 ## Development
 

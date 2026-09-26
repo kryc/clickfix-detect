@@ -1,9 +1,4 @@
-use std::collections::BTreeMap;
-use std::io::Read;
-use std::net::{IpAddr, ToSocketAddrs};
 use std::time::Duration;
-
-use url::Url;
 
 use crate::{NetworkRequest, NetworkResponse};
 
@@ -38,10 +33,16 @@ impl NetworkPolicy {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 pub(crate) fn send(
     policy: &NetworkPolicy,
     request: &NetworkRequest,
 ) -> Result<NetworkResponse, String> {
+    use std::collections::BTreeMap;
+    use std::io::Read;
+
+    use url::Url;
+
     if !policy.enabled {
         return Err("network access is disabled".into());
     }
@@ -120,7 +121,20 @@ pub(crate) fn send(
     Err("network redirect handling failed".into())
 }
 
+#[cfg(target_arch = "wasm32")]
+pub(crate) fn send(
+    _policy: &NetworkPolicy,
+    _request: &NetworkRequest,
+) -> Result<NetworkResponse, String> {
+    Err("real network access is unavailable in the browser build".into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn validate_url(policy: &NetworkPolicy, value: &str) -> Result<(), String> {
+    use std::net::ToSocketAddrs;
+
+    use url::Url;
+
     let url = Url::parse(value).map_err(|error| format!("invalid URL: {error}"))?;
     if !matches!(url.scheme(), "http" | "https") {
         return Err(format!("network scheme {} is not allowed", url.scheme()));
@@ -149,7 +163,10 @@ fn validate_url(policy: &NetworkPolicy, value: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn is_public_ip(ip: IpAddr) -> bool {
+#[cfg(not(target_arch = "wasm32"))]
+fn is_public_ip(ip: std::net::IpAddr) -> bool {
+    use std::net::IpAddr;
+
     match ip {
         IpAddr::V4(ip) => {
             !(ip.is_private()
@@ -182,6 +199,7 @@ fn is_public_ip(ip: IpAddr) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn rejects_private_and_metadata_destinations() {
         for address in [

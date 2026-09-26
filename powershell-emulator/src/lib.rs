@@ -205,7 +205,7 @@ impl PowerShellEmulator {
                 depth,
                 Engine::PowerShell,
                 EventKind::Parse,
-                "parsed PowerShell input with tree-sitter",
+                Self::parse_message(),
             )
             .with_data("bytes", script.len().to_string())
             .with_data("tokens", tokenization.tokens.len().to_string()),
@@ -218,6 +218,32 @@ impl PowerShellEmulator {
             );
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        Self::check_parse_tree(script, host, depth)?;
+
+        let last_value = self.execute_script(script, host, depth)?;
+        Ok(PowerShellResult {
+            stdout: self.stdout.clone(),
+            last_value,
+        })
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn parse_message() -> &'static str {
+        "parsed PowerShell input with tree-sitter"
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn parse_message() -> &'static str {
+        "parsed PowerShell input with span tokenizer"
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn check_parse_tree(
+        script: &str,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<(), PowerShellError> {
         let mut parser = tree_sitter::Parser::new();
         parser
             .set_language(&tree_sitter_powershell::language())
@@ -237,12 +263,7 @@ impl PowerShellEmulator {
                 "tree-sitter did not return a PowerShell parse tree",
             );
         }
-
-        let last_value = self.execute_script(script, host, depth)?;
-        Ok(PowerShellResult {
-            stdout: self.stdout.clone(),
-            last_value,
-        })
+        Ok(())
     }
 }
 

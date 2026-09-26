@@ -6,13 +6,15 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
-clap.workspace = true
 emulator-core = { path = "../emulator-core" }
 regex.workspace = true
-rustyline.workspace = true
 serde.workspace = true
 thiserror.workspace = true
 urlencoding.workspace = true
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap.workspace = true
+rustyline.workspace = true
 
 [lints]
 workspace = true
