@@ -26,11 +26,17 @@ pub enum Redirect {
 pub enum TokenKind {
     Whitespace,
     Newline,
+    Comment,
+    Label,
+    EchoControl,
     QuotedString,
     CaretEscape,
     LineContinuation,
     PercentVariable,
     DelayedVariable,
+    ForVariable,
+    BatchParameter,
+    PercentEscape,
     Word,
     LeftParen,
     RightParen,
@@ -66,90 +72,144 @@ pub struct Tokenization {
 }
 
 #[must_use]
+#[allow(clippy::too_many_lines)]
 pub fn tokenize(source: &str) -> Tokenization {
     let mut result = Tokenization::default();
     let mut offset = 0;
+    let mut line_start = true;
+    let mut command_start = true;
     while offset < source.len() {
         let start = offset;
         let ch = next_char(source, offset);
-        let kind = match ch {
-            '\r' => {
-                offset += 1;
-                if source.as_bytes().get(offset) == Some(&b'\n') {
+        let kind = if line_start && source[start..].starts_with("::") {
+            consume_to_newline(source, &mut offset);
+            TokenKind::Comment
+        } else if line_start && ch == ':' {
+            consume_to_newline(source, &mut offset);
+            TokenKind::Label
+        } else if command_start && starts_rem_comment(source, start) {
+            consume_to_newline(source, &mut offset);
+            TokenKind::Comment
+        } else {
+            match ch {
+                '\r' => {
                     offset += 1;
+                    if source.as_bytes().get(offset) == Some(&b'\n') {
+                        offset += 1;
+                    }
+                    TokenKind::Newline
                 }
-                TokenKind::Newline
-            }
-            '\n' => {
-                offset += 1;
-                TokenKind::Newline
-            }
-            ' ' | '\t' => {
-                offset += ch.len_utf8();
-                while offset < source.len() && matches!(next_char(source, offset), ' ' | '\t') {
-                    offset += next_char(source, offset).len_utf8();
-                }
-                TokenKind::Whitespace
-            }
-            '"' => {
-                consume_quote(source, &mut offset, start, &mut result.diagnostics);
-                TokenKind::QuotedString
-            }
-            '^' => consume_caret(source, &mut offset, start, &mut result.diagnostics),
-            '%' | '!' => consume_variable(source, &mut offset, ch),
-            '(' => {
-                offset += 1;
-                TokenKind::LeftParen
-            }
-            ')' => {
-                offset += 1;
-                TokenKind::RightParen
-            }
-            ',' => {
-                offset += 1;
-                TokenKind::Comma
-            }
-            ';' => {
-                offset += 1;
-                TokenKind::Semicolon
-            }
-            '&' => {
-                offset += 1;
-                if source.as_bytes().get(offset) == Some(&b'&') {
+                '\n' => {
                     offset += 1;
-                    TokenKind::Operator(Operator::And)
-                } else {
-                    TokenKind::Operator(Operator::Ampersand)
+                    TokenKind::Newline
                 }
-            }
-            '|' => {
-                offset += 1;
-                if source.as_bytes().get(offset) == Some(&b'|') {
+                ' ' | '\t' => {
+                    offset += ch.len_utf8();
+                    while offset < source.len() && matches!(next_char(source, offset), ' ' | '\t') {
+                        offset += next_char(source, offset).len_utf8();
+                    }
+                    TokenKind::Whitespace
+                }
+                '"' => {
+                    consume_quote(source, &mut offset);
+                    TokenKind::QuotedString
+                }
+                '^' => consume_caret(source, &mut offset, start, &mut result.diagnostics),
+                '%' => consume_percent(source, &mut offset),
+                '!' => consume_variable(source, &mut offset, ch),
+                '@' if command_start => {
                     offset += 1;
-                    TokenKind::Operator(Operator::Or)
-                } else {
-                    TokenKind::Operator(Operator::Pipe)
+                    TokenKind::EchoControl
                 }
-            }
-            '>' | '<' => consume_redirect(source, &mut offset, false),
-            '0'..='9' if starts_redirect(source, offset) => {
-                while offset < source.len() && next_char(source, offset).is_ascii_digit() {
+                '(' => {
                     offset += 1;
+                    TokenKind::LeftParen
                 }
-                consume_redirect(source, &mut offset, true)
-            }
-            _ => {
-                offset += ch.len_utf8();
-                consume_word(source, &mut offset);
-                TokenKind::Word
+                ')' => {
+                    offset += 1;
+                    TokenKind::RightParen
+                }
+                ',' => {
+                    offset += 1;
+                    TokenKind::Comma
+                }
+                ';' => {
+                    offset += 1;
+                    TokenKind::Semicolon
+                }
+                '&' => {
+                    offset += 1;
+                    if source.as_bytes().get(offset) == Some(&b'&') {
+                        offset += 1;
+                        TokenKind::Operator(Operator::And)
+                    } else {
+                        TokenKind::Operator(Operator::Ampersand)
+                    }
+                }
+                '|' => {
+                    offset += 1;
+                    if source.as_bytes().get(offset) == Some(&b'|') {
+                        offset += 1;
+                        TokenKind::Operator(Operator::Or)
+                    } else {
+                        TokenKind::Operator(Operator::Pipe)
+                    }
+                }
+                '>' | '<' => consume_redirect(source, &mut offset, false),
+                '0'..='9' if starts_redirect(source, offset) => {
+                    while offset < source.len() && next_char(source, offset).is_ascii_digit() {
+                        offset += 1;
+                    }
+                    consume_redirect(source, &mut offset, true)
+                }
+                _ => {
+                    offset += ch.len_utf8();
+                    consume_word(source, &mut offset);
+                    TokenKind::Word
+                }
             }
         };
         result.tokens.push(Token {
             kind,
             span: Span { start, end: offset },
         });
+        match result.tokens.last().map(|token| &token.kind) {
+            Some(TokenKind::Newline) => {
+                line_start = true;
+                command_start = true;
+            }
+            Some(TokenKind::Whitespace) => {}
+            Some(TokenKind::EchoControl) if command_start => {
+                line_start = false;
+            }
+            Some(TokenKind::Operator(_) | TokenKind::LeftParen) => {
+                line_start = false;
+                command_start = true;
+            }
+            _ => {
+                line_start = false;
+                command_start = false;
+            }
+        }
     }
+
     result
+}
+
+fn consume_to_newline(source: &str, offset: &mut usize) {
+    while *offset < source.len() && !matches!(next_char(source, *offset), '\r' | '\n') {
+        *offset += next_char(source, *offset).len_utf8();
+    }
+}
+
+fn starts_rem_comment(source: &str, offset: usize) -> bool {
+    source[offset..]
+        .get(..3)
+        .is_some_and(|value| value.eq_ignore_ascii_case("rem"))
+        && source[offset + 3..]
+            .chars()
+            .next()
+            .is_none_or(char::is_whitespace)
 }
 
 fn next_char(source: &str, offset: usize) -> char {
@@ -159,27 +219,18 @@ fn next_char(source: &str, offset: usize) -> char {
         .expect("offset is in source")
 }
 
-fn consume_quote(
-    source: &str,
-    offset: &mut usize,
-    start: usize,
-    diagnostics: &mut Vec<Diagnostic>,
-) {
+fn consume_quote(source: &str, offset: &mut usize) {
     *offset += 1;
     while *offset < source.len() {
         let current = next_char(source, *offset);
+        if matches!(current, '\r' | '\n') {
+            return;
+        }
         *offset += current.len_utf8();
         if current == '"' {
             return;
         }
     }
-    diagnostics.push(Diagnostic {
-        span: Span {
-            start,
-            end: *offset,
-        },
-        message: "unterminated quoted string".into(),
-    });
 }
 
 fn consume_caret(
@@ -222,6 +273,52 @@ fn consume_variable(source: &str, offset: &mut usize, delimiter: char) -> TokenK
     } else {
         consume_word(source, offset);
         TokenKind::Word
+    }
+}
+
+fn consume_percent(source: &str, offset: &mut usize) -> TokenKind {
+    *offset += 1;
+    let Some(next) = source.get(*offset..).and_then(|value| value.chars().next()) else {
+        return TokenKind::Word;
+    };
+    if next == '%' {
+        *offset += 1;
+        if source
+            .get(*offset..)
+            .and_then(|value| value.chars().next())
+            .is_some_and(|character| character == '~' || character.is_ascii_alphanumeric())
+        {
+            consume_batch_reference_tail(source, offset);
+            return TokenKind::ForVariable;
+        }
+        return TokenKind::PercentEscape;
+    }
+    if next == '~' || next.is_ascii_digit() || next == '*' {
+        consume_batch_reference_tail(source, offset);
+        return TokenKind::BatchParameter;
+    }
+    if let Some(relative) = source[*offset..].find('%') {
+        *offset += relative + 1;
+        return TokenKind::PercentVariable;
+    }
+    consume_word(source, offset);
+    TokenKind::Word
+}
+
+fn consume_batch_reference_tail(source: &str, offset: &mut usize) {
+    if source.as_bytes().get(*offset) == Some(&b'~') {
+        *offset += 1;
+        while *offset < source.len() {
+            let character = next_char(source, *offset);
+            if character.is_ascii_alphabetic() || matches!(character, '$' | ':' | '_') {
+                *offset += character.len_utf8();
+            } else {
+                break;
+            }
+        }
+    }
+    if *offset < source.len() {
+        *offset += next_char(source, *offset).len_utf8();
     }
 }
 
@@ -339,8 +436,54 @@ mod tests {
     }
 
     #[test]
-    fn malformed_quote_is_diagnostic_but_still_tokenized() {
+    fn recognizes_batch_parameters_and_for_variables() {
+        let result = assert_complete("echo %0 %~dp0 %* %%A %%~fA %%");
+        let kinds = result
+            .tokens
+            .iter()
+            .filter(|token| !matches!(token.kind, TokenKind::Whitespace))
+            .map(|token| token.kind.clone())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            kinds,
+            [
+                TokenKind::Word,
+                TokenKind::BatchParameter,
+                TokenKind::BatchParameter,
+                TokenKind::BatchParameter,
+                TokenKind::ForVariable,
+                TokenKind::ForVariable,
+                TokenKind::PercentEscape,
+            ]
+        );
+    }
+
+    #[test]
+    fn recognizes_labels_comments_and_echo_control() {
+        let result = assert_complete(" :start\r\n@rem hidden\r\n:: comment\r\necho shown");
+        assert!(result
+            .tokens
+            .iter()
+            .any(|token| token.kind == TokenKind::Label));
+        assert_eq!(
+            result
+                .tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::Comment)
+                .count(),
+            2
+        );
+        assert!(result
+            .tokens
+            .iter()
+            .any(|token| token.kind == TokenKind::EchoControl));
+    }
+
+    #[test]
+    fn unmatched_quote_stops_at_the_end_of_the_line() {
         let result = assert_complete("echo \"unfinished");
-        assert_eq!(result.diagnostics.len(), 1);
+        assert!(result.diagnostics.is_empty());
+        assert_eq!(result.tokens.last().unwrap().kind, TokenKind::QuotedString);
     }
 }

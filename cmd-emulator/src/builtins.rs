@@ -1,49 +1,43 @@
 use crate::batch::BatchAction;
-use crate::syntax::{command_and_rest, split_words};
+use crate::syntax::split_words;
 use crate::{CmdEmulator, CmdError, CommandOutput};
 use emulator_core::{Engine, EventKind, Host, ProcessIntent, TraceEvent};
 
-pub(crate) fn execute(
+pub(crate) fn execute_parts(
     emulator: &mut CmdEmulator,
-    source: &str,
+    command: &str,
+    rest: &str,
     host: &mut dyn Host,
     depth: usize,
 ) -> Result<CommandOutput, CmdError> {
-    let (command, rest) = command_and_rest(source);
     let name = command
         .trim_start_matches('@')
         .trim_matches('"')
         .to_ascii_lowercase();
     match name.as_str() {
         "" | "rem" | "::" | "cls" => Ok(success()),
-        "echo" => Ok(echo(emulator, &rest)),
-        "set" => Ok(set(&rest, host, depth)),
-        "cd" | "chdir" => Ok(cd(emulator, &rest, host)),
-        "pushd" => Ok(pushd(emulator, &rest, host)),
+        "echo" => Ok(echo(emulator, rest)),
+        "set" => Ok(set(rest, host, depth)),
+        "cd" | "chdir" => Ok(cd(emulator, rest, host)),
+        "pushd" => Ok(pushd(emulator, rest, host)),
         "popd" => Ok(popd(emulator)),
-        "md" | "mkdir" => mkdir(emulator, &rest, host, depth),
-        "rd" | "rmdir" => Ok(rmdir(emulator, &rest, host, depth)),
-        "dir" => Ok(dir(emulator, &rest, host, depth)),
-        "type" => Ok(type_files(emulator, &rest, host, depth)),
-        "copy" => copy(emulator, &rest, host, depth),
-        "move" => move_files(emulator, &rest, host, depth),
-        "del" | "erase" => Ok(delete(emulator, &rest, host, depth)),
-        "ren" | "rename" => rename(emulator, &rest, host, depth),
+        "md" | "mkdir" => mkdir(emulator, rest, host, depth),
+        "rd" | "rmdir" => Ok(rmdir(emulator, rest, host, depth)),
+        "dir" => Ok(dir(emulator, rest, host, depth)),
+        "type" => Ok(type_files(emulator, rest, host, depth)),
+        "copy" => copy(emulator, rest, host, depth),
+        "move" => move_files(emulator, rest, host, depth),
+        "del" | "erase" => Ok(delete(emulator, rest, host, depth)),
+        "ren" | "rename" => rename(emulator, rest, host, depth),
         "ver" => Ok(output("Microsoft Windows [Version 10.0.22631.0]")),
-        "path" => Ok(path(&rest, host)),
-        "exit" => Ok(exit(emulator, &rest)),
-        "start" => start(emulator, &rest, host, depth),
-        "call" => call(emulator, &rest, host, depth),
-        "goto" => Ok(goto(emulator, &rest)),
+        "path" => Ok(path(rest, host)),
+        "exit" => Ok(exit(emulator, rest)),
+        "start" => start(emulator, rest, host, depth),
+        "call" => call(emulator, rest, host, depth),
+        "goto" => Ok(goto(emulator, rest)),
         "shift" => Ok(shift(emulator)),
-        "cmd" | "cmd.exe" => nested_cmd(emulator, &rest, host, depth),
-        _ => external(
-            emulator,
-            command.trim_start_matches('@'),
-            &rest,
-            host,
-            depth,
-        ),
+        "cmd" | "cmd.exe" => nested_cmd(emulator, rest, host, depth),
+        _ => external(emulator, command.trim_start_matches('@'), rest, host, depth),
     }
 }
 

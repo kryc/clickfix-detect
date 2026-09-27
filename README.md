@@ -10,7 +10,7 @@ an explicit bounded public-HTTP(S) opt-in.
 | Package | Purpose |
 | --- | --- |
 | `emulator-core` | Shared trace events, evidence, artifacts, limits, host traits, and the in-memory virtual host |
-| `cmd-emulator` | Standalone, span-tokenized `cmd.exe` emulation with virtual files and typed process intents |
+| `cmd-emulator` | Standalone, tokenized and AST-driven `cmd.exe`/batch emulation with virtual files and typed process intents |
 | `powershell-emulator` | Tree-sitter-backed PowerShell parsing and bounded hermetic interpretation |
 | `windows-script-emulator` | Bounded JScript/VBScript interpreter for WScript, CScript, HTA, scriptlet, and COM behavior |
 | `runbox-emulator` | Windows command dispatch, virtual process recursion, and launcher modeling |

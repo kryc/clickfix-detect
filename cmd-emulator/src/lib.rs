@@ -1,18 +1,22 @@
+mod ast;
 mod batch;
 mod builtins;
 mod control;
 mod expansion;
+mod parser;
 mod runtime;
 mod syntax;
 
 pub mod tokenizer;
 
+use ast::{Command, CommandKind, ForMode, IfCondition, Program};
 use batch::{BatchAction, BatchContext};
 use emulator_core::{Engine, EventKind, Host, HostError, TraceEvent};
+use parser::ParsedDocument;
 use runtime::Runtime;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use syntax::{parse_redirections, split_chain, strip_outer_group, ChainOperator, Stream};
+use syntax::{unquote_and_unescape, ChainOperator, Stream};
 use thiserror::Error;
 
 const MAX_INPUT_BYTES: usize = 1024 * 1024;
@@ -23,6 +27,14 @@ pub struct CmdResult {
     pub stderr: Vec<String>,
     pub exit_code: i32,
     pub exited: bool,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CmdParseSummary {
+    pub bytes: usize,
+    pub tokens: usize,
+    pub commands: usize,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -91,6 +103,45 @@ impl CmdEmulator {
         self.runtime.error_level
     }
 
+    #[must_use]
+    pub fn parse(command: &str) -> CmdParseSummary {
+        let document = ParsedDocument::parse(command);
+        CmdParseSummary {
+            bytes: command.len(),
+            tokens: document.tokens().len(),
+            commands: document.program().parts.len(),
+            diagnostics: document
+                .diagnostics()
+                .iter()
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect(),
+        }
+    }
+
+    #[must_use]
+    pub fn parse_batch(batch: &str) -> CmdParseSummary {
+        let context = BatchContext::new(batch, "<batch>", Vec::new());
+        CmdParseSummary {
+            bytes: batch.len(),
+            tokens: context
+                .lines
+                .iter()
+                .map(|document| document.tokens().len())
+                .sum(),
+            commands: context
+                .lines
+                .iter()
+                .map(|document| document.program().parts.len())
+                .sum(),
+            diagnostics: context
+                .lines
+                .iter()
+                .flat_map(ParsedDocument::diagnostics)
+                .map(|diagnostic| diagnostic.message.clone())
+                .collect(),
+        }
+    }
+
     /// Emulates a command line without invoking host processes or touching the host filesystem.
     ///
     /// # Errors
@@ -106,20 +157,20 @@ impl CmdEmulator {
             return Err(CmdError::InputTooLarge);
         }
         host.consume_step(Engine::Cmd, depth, "parsing cmd input")?;
-        let tokenization = tokenizer::tokenize(command);
+        let document = ParsedDocument::parse(command);
         host.emit(
             TraceEvent::new(depth, Engine::Cmd, EventKind::Parse, "tokenized cmd input")
                 .with_data("bytes", command.len().to_string())
-                .with_data("tokens", tokenization.tokens.len().to_string()),
+                .with_data("tokens", document.tokens().len().to_string()),
         );
-        for diagnostic in tokenization.diagnostics {
+        for diagnostic in document.diagnostics() {
             host.unsupported(
                 Engine::Cmd,
                 depth,
                 &format!("cmd tokenizer diagnostic: {}", diagnostic.message),
             );
         }
-        let output = self.execute_chain(command, host, depth)?;
+        let output = self.execute_program(&document, document.program(), host, depth)?;
         Ok(CmdResult {
             stdout: output.stdout,
             stderr: output.stderr,
@@ -193,11 +244,11 @@ impl CmdEmulator {
             )?;
             let line = context.lines[context.pc].clone();
             self.batch.as_mut().expect("batch context exists").pc += 1;
-            let trimmed = line.trim();
-            if trimmed.is_empty() || BatchContext::is_label(trimmed) || trimmed.starts_with("::") {
+            let trimmed = line.source().trim();
+            if trimmed.is_empty() || line.is_non_executable() {
                 continue;
             }
-            let line_output = self.execute_chain(trimmed, host, execution_depth)?;
+            let line_output = self.execute_program(&line, line.program(), host, execution_depth)?;
             result.stdout.extend(line_output.stdout);
             result.stderr.extend(line_output.stderr);
             result.code = line_output.code;
@@ -309,7 +360,18 @@ impl CmdEmulator {
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<CommandOutput, CmdError> {
-        let parts = split_chain(command);
+        let document = ParsedDocument::parse(command);
+        self.execute_program(&document, document.program(), host, depth)
+    }
+
+    fn execute_program(
+        &mut self,
+        document: &ParsedDocument,
+        program: &Program,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<CommandOutput, CmdError> {
+        let parts = &program.parts;
         let mut aggregate = CommandOutput {
             code: self.runtime.error_level,
             ..CommandOutput::default()
@@ -329,8 +391,7 @@ impl CmdEmulator {
                 }
                 continue;
             }
-            let expanded = self.expand(&part.command, host);
-            let mut output = self.execute_one(&expanded, host, depth)?;
+            let mut output = self.execute_ast_command(document, &part.command, host, depth)?;
             let previous_pipe = self.pipe_input.take();
             while index + 1 < parts.len()
                 && parts[index + 1].operator == ChainOperator::Pipe
@@ -340,8 +401,7 @@ impl CmdEmulator {
                 aggregate.stderr.append(&mut output.stderr);
                 self.pipe_input = Some(std::mem::take(&mut output.stdout));
                 index += 1;
-                let expanded = self.expand(&parts[index].command, host);
-                output = self.execute_one(&expanded, host, depth)?;
+                output = self.execute_ast_command(document, &parts[index].command, host, depth)?;
             }
             self.pipe_input = previous_pipe;
             aggregate.stdout.append(&mut output.stdout);
@@ -357,31 +417,48 @@ impl CmdEmulator {
         Ok(aggregate)
     }
 
-    fn execute_one(
+    fn execute_ast_command(
         &mut self,
-        command: &str,
+        document: &ParsedDocument,
+        command: &Command,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<CommandOutput, CmdError> {
-        host.consume_step(Engine::Cmd, depth, "executing cmd command")?;
-        let (command, redirections) = parse_redirections(command);
-        host.emit(
-            TraceEvent::new(
-                depth,
-                Engine::Cmd,
-                EventKind::Command,
-                "emulated cmd command",
-            )
-            .with_data("command", command.clone()),
-        );
-        let mut output = if let Some(inner) = strip_outer_group(&command) {
-            self.execute_chain(inner, host, depth + 1)?
-        } else if let Some(output) = control::execute(self, &command, host, depth)? {
-            output
+        let raw = render_core(document, command);
+        let expanded = self.expand(&raw, host);
+        let mut output = if expanded == raw {
+            host.consume_step(Engine::Cmd, depth, "executing cmd command")?;
+            host.emit(
+                TraceEvent::new(
+                    depth,
+                    Engine::Cmd,
+                    EventKind::Command,
+                    "emulated cmd command",
+                )
+                .with_data("command", raw.clone()),
+            );
+            if let Some(group) = &command.group {
+                self.execute_program(document, group, host, depth + 1)?
+            } else if let CommandKind::If(statement) = &command.kind {
+                self.execute_ast_if(document, statement, host, depth)?
+            } else if let CommandKind::For(statement) = &command.kind {
+                self.execute_ast_for(document, statement, host, depth)?
+            } else if let CommandKind::Simple { command, arguments } = &command.kind {
+                let command = unquote_and_unescape(document.text(*command));
+                let rest = arguments
+                    .iter()
+                    .map(|argument| document.text(*argument))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                builtins::execute_parts(self, &command, &rest, host, depth)?
+            } else {
+                unreachable!("all cmd command kinds are handled")
+            }
         } else {
-            builtins::execute(self, &command, host, depth)?
+            let expanded_document = ParsedDocument::parse(&expanded);
+            self.execute_program(&expanded_document, expanded_document.program(), host, depth)?
         };
-        self.apply_redirections(&mut output, redirections, host, depth)?;
+        self.apply_ast_redirections(&mut output, document, &command.redirections, host, depth)?;
         for line in &output.stdout {
             host.emit(
                 TraceEvent::new(depth, Engine::Cmd, EventKind::Output, line.clone())
@@ -397,6 +474,195 @@ impl CmdEmulator {
             );
         }
         Ok(output)
+    }
+
+    fn execute_ast_if(
+        &mut self,
+        document: &ParsedDocument,
+        statement: &ast::IfCommand,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<CommandOutput, CmdError> {
+        use std::cmp::Ordering;
+        let condition = match statement.condition {
+            IfCondition::ErrorLevel(value) => {
+                let threshold = document
+                    .text(value)
+                    .trim_matches('"')
+                    .parse::<i32>()
+                    .unwrap_or(i32::MAX);
+                self.runtime.error_level >= threshold
+            }
+
+            IfCondition::Exist(path) => {
+                let path = document.text(path).trim_matches('"');
+                let resolved = self.runtime.resolve_path(path);
+                let normalized = emulator_core::normalize_windows_path(&resolved);
+                if resolved.contains(['*', '?']) {
+                    let prefix = resolved.split(['*', '?']).next().unwrap_or(&resolved);
+                    host.list_files(prefix, Engine::Cmd, depth)
+                        .iter()
+                        .any(|file| wildcard_match(file, &resolved))
+                        || self
+                            .runtime
+                            .directories
+                            .iter()
+                            .any(|directory| wildcard_match(directory, &normalized))
+                        || host
+                            .list_directories(prefix, Engine::Cmd, depth)
+                            .iter()
+                            .any(|directory| wildcard_match(directory, &normalized))
+                } else {
+                    self.runtime.directories.contains(&normalized)
+                        || host.directory_exists(&resolved)
+                        || host.read_file(&resolved, Engine::Cmd, depth).is_some()
+                }
+            }
+
+            IfCondition::Defined(name) => host
+                .environment(document.text(name).trim_matches('"'))
+                .is_some(),
+            IfCondition::Equal { left, right } => {
+                compare_cmd_values(
+                    document.text(left).trim_matches('"'),
+                    document.text(right).trim_matches('"'),
+                    statement.ignore_case,
+                ) == Ordering::Equal
+            }
+            IfCondition::Compare {
+                left,
+                operator,
+                right,
+            } => {
+                let ordering = compare_cmd_values(
+                    document.text(left).trim_matches('"'),
+                    document.text(right).trim_matches('"'),
+                    statement.ignore_case,
+                );
+                match document.text(operator).to_ascii_lowercase().as_str() {
+                    "equ" => ordering == Ordering::Equal,
+                    "neq" => ordering != Ordering::Equal,
+                    "lss" => ordering == Ordering::Less,
+                    "leq" => ordering != Ordering::Greater,
+                    "gtr" => ordering == Ordering::Greater,
+                    "geq" => ordering != Ordering::Less,
+                    _ => false,
+                }
+            }
+        };
+        let condition = if statement.negate {
+            !condition
+        } else {
+            condition
+        };
+        let selected = if condition {
+            Some(statement.then_program.as_ref())
+        } else {
+            statement.else_program.as_deref()
+        };
+        if let Some(program) = selected {
+            self.execute_program(document, program, host, depth + 1)
+        } else {
+            Ok(CommandOutput {
+                code: self.runtime.error_level,
+                ..CommandOutput::default()
+            })
+        }
+    }
+
+    fn execute_ast_for(
+        &mut self,
+        document: &ParsedDocument,
+        statement: &ast::ForCommand,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<CommandOutput, CmdError> {
+        let mut prelude = CommandOutput {
+            code: self.runtime.error_level,
+            ..CommandOutput::default()
+        };
+        let set = document.text(statement.set);
+        let values = match &statement.mode {
+            ForMode::Simple => syntax::split_words(set)
+                .into_iter()
+                .map(|value| vec![value])
+                .collect(),
+            ForMode::Linear => control::linear_values(set, host.limits().max_loop_iterations),
+            ForMode::Recursive { root } => control::recursive_values(
+                self,
+                root.map(|root| document.text(root).trim_matches('"'))
+                    .unwrap_or_default(),
+                set,
+                host,
+                depth,
+            ),
+            ForMode::Text { options } => {
+                control::text_values(self, set, options, host, depth, &mut prelude)?
+            }
+        };
+        let mut output = prelude;
+        let limit = host.limits().max_loop_iterations;
+        for (iteration, assignments) in values.into_iter().enumerate() {
+            if iteration >= limit {
+                host.emit(
+                    TraceEvent::new(
+                        depth,
+                        Engine::Cmd,
+                        EventKind::LimitReached,
+                        "cmd FOR iteration limit reached",
+                    )
+                    .with_data("limit", limit.to_string()),
+                );
+                return Err(CmdError::LoopLimit { limit });
+            }
+            host.consume_step(Engine::Cmd, depth, "executing cmd FOR iteration")?;
+            let variables = control::assignments_for(statement.variable, assignments);
+            let previous = variables
+                .iter()
+                .map(|(name, _)| (*name, self.loop_variables.get(name).cloned()))
+                .collect::<Vec<_>>();
+            self.loop_variables.extend(variables);
+            let result = self.execute_program(document, &statement.body, host, depth + 1);
+            for (name, value) in previous {
+                if let Some(value) = value {
+                    self.loop_variables.insert(name, value);
+                } else {
+                    self.loop_variables.remove(&name);
+                }
+            }
+            let result = result?;
+            output.stdout.extend(result.stdout);
+            output.stderr.extend(result.stderr);
+            output.code = result.code;
+            output.exited = result.exited;
+            if result.exited || self.has_batch_action() {
+                break;
+            }
+        }
+        Ok(output)
+    }
+
+    fn apply_ast_redirections(
+        &self,
+        output: &mut CommandOutput,
+        document: &ParsedDocument,
+        redirections: &[ast::Redirection],
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<(), CmdError> {
+        let redirections = redirections
+            .iter()
+            .map(|redirection| syntax::Redirection {
+                stream: redirection.stream,
+                target: redirection
+                    .target
+                    .map(|target| unquote_and_unescape(document.text(target)))
+                    .unwrap_or_default(),
+                append: redirection.append,
+                merge_to: redirection.merge_to,
+            })
+            .collect();
+        self.apply_redirections(output, redirections, host, depth)
     }
 
     fn apply_redirections(
@@ -459,5 +725,42 @@ fn route_output(
             let entry = files.entry(path).or_insert_with(|| (append, Vec::new()));
             entry.1.extend(lines);
         }
+    }
+}
+
+fn render_core(document: &ParsedDocument, command: &Command) -> String {
+    command
+        .core_ranges
+        .iter()
+        .map(|range| document.text(*range))
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
+fn compare_cmd_values(left: &str, right: &str, ignore_case: bool) -> std::cmp::Ordering {
+    match (left.parse::<i64>(), right.parse::<i64>()) {
+        (Ok(left), Ok(right)) => left.cmp(&right),
+        _ if ignore_case => left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase()),
+        _ => left.cmp(right),
+    }
+}
+
+fn wildcard_match(value: &str, pattern: &str) -> bool {
+    wildcard_bytes(
+        value.to_ascii_lowercase().as_bytes(),
+        pattern.to_ascii_lowercase().as_bytes(),
+    )
+}
+
+fn wildcard_bytes(value: &[u8], pattern: &[u8]) -> bool {
+    match pattern {
+        [] => value.is_empty(),
+        [b'*', rest @ ..] => {
+            wildcard_bytes(value, rest)
+                || (!value.is_empty() && wildcard_bytes(&value[1..], pattern))
+        }
+        [b'?', rest @ ..] => !value.is_empty() && wildcard_bytes(&value[1..], rest),
+        [first, rest @ ..] => value.first() == Some(first) && wildcard_bytes(&value[1..], rest),
     }
 }

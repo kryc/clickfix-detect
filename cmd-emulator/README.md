@@ -47,6 +47,13 @@ modifiers, environment replacement/substrings, and CALL double expansion are
 modeled. `--file` exposes the supplied path through `%0`; repeatable
 `--arg VALUE` options provide `%1` and later arguments.
 
+Each command source is tokenized once into a span-preserving parsed document.
+Command chains, pipelines, groups, redirections, command names, arguments,
+`if`, and all supported `for` modes are represented as typed AST nodes.
+Logical batch lines retain their parsed documents across loops, `goto`, and
+subroutine calls. Environment or delayed expansion that changes command text
+creates one explicit generated document before execution.
+
 The control-flow slice includes `if` error-level, existence, definition,
 equality, and ordered comparisons with `not`, blocks, and `else`. `for`
 supports simple sets, `/L`, `/R`, and basic `/F` parsing over strings, virtual
@@ -54,5 +61,6 @@ files, and backquoted command output. Program counters, call depth, steps, and
 loop iterations use the configured analysis limits.
 
 Library users construct `CmdEmulator` and call `emulate`, `emulate_batch`, or
-`emulate_batch_with_args` with a `emulator_core::Host`. All files remain
+`emulate_batch_with_args` with an `emulator_core::Host`. `CmdEmulator::parse`
+and `CmdEmulator::parse_batch` provide parse-only summaries. All files remain
 virtual and every external command becomes a `ProcessIntent`.

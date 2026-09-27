@@ -1,3 +1,4 @@
+use crate::parser::ParsedDocument;
 use std::collections::BTreeMap;
 
 #[derive(Debug, Clone)]
@@ -16,7 +17,7 @@ struct CallFrame {
 
 #[derive(Debug, Clone)]
 pub(crate) struct BatchContext {
-    pub lines: Vec<String>,
+    pub lines: Vec<ParsedDocument>,
     pub labels: BTreeMap<String, usize>,
     pub file_name: String,
     pub args: Vec<String>,
@@ -28,11 +29,14 @@ pub(crate) struct BatchContext {
 
 impl BatchContext {
     pub fn new(source: &str, file_name: &str, args: Vec<String>) -> Self {
-        let lines = logical_lines(source);
+        let lines = logical_lines(source)
+            .into_iter()
+            .map(|line| ParsedDocument::parse(&line))
+            .collect::<Vec<_>>();
         let labels = lines
             .iter()
             .enumerate()
-            .filter_map(|(index, line)| parse_label(line).map(|label| (label, index)))
+            .filter_map(|(index, line)| line.label().map(|label| (label, index)))
             .collect();
         Self {
             lines,
@@ -112,11 +116,6 @@ impl BatchContext {
     pub fn call_depth(&self) -> usize {
         self.call_stack.len()
     }
-
-    #[must_use]
-    pub fn is_label(line: &str) -> bool {
-        parse_label(line).is_some()
-    }
 }
 
 fn logical_lines(source: &str) -> Vec<String> {
@@ -181,15 +180,6 @@ fn paren_delta(source: &str) -> i32 {
         }
     }
     delta
-}
-
-fn parse_label(line: &str) -> Option<String> {
-    let trimmed = line.trim();
-    if !trimmed.starts_with(':') || trimmed.starts_with("::") {
-        return None;
-    }
-    let label = trimmed[1..].split_whitespace().next().unwrap_or_default();
-    (!label.is_empty()).then(|| normalize_label(label))
 }
 
 fn normalize_label(label: &str) -> String {
