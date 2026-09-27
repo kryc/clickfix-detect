@@ -2,20 +2,20 @@ use crate::parser::ParsedSource;
 use crate::syntax::{
     extract_delimited, normalize_variable, split_key_value, split_top_level, starts_word,
 };
-use crate::tokenizer::TokenKind;
+use crate::tokenizer::{Span, TokenKind};
 use crate::Value;
 
 #[derive(Debug, Clone)]
 pub(crate) struct FunctionDefinition {
     pub(crate) parser: ParsedSource,
     pub(crate) parameters: Vec<FunctionParameter>,
-    pub(crate) body: String,
+    pub(crate) body: Span,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct FunctionParameter {
     pub(crate) name: String,
-    pub(crate) default: Option<String>,
+    pub(crate) default: Option<Span>,
 }
 
 impl FunctionDefinition {
@@ -33,7 +33,7 @@ impl FunctionDefinition {
                         .map(|parameter| {
                             let (declaration, default) = split_key_value(parser, parameter)
                                 .map_or((parameter, None), |(declaration, default)| {
-                                    (declaration, Some(default.into()))
+                                    (declaration, parser.range(default))
                                 });
                             FunctionParameter {
                                 name: parameter_name(parser, declaration),
@@ -42,17 +42,16 @@ impl FunctionDefinition {
                         })
                         .filter(|parameter| !parameter.name.is_empty())
                         .collect(),
-                    body: remainder
-                        .trim_start_matches([';', '\r', '\n'])
-                        .trim()
-                        .into(),
+                    body: parser
+                        .range(remainder.trim_start_matches([';', '\r', '\n']).trim())
+                        .unwrap_or_else(|| Span::new(0, 0)),
                 };
             }
         }
         Self {
             parser: parser.clone(),
             parameters: Vec::new(),
-            body: body.into(),
+            body: parser.range(body).unwrap_or_else(|| Span::new(0, 0)),
         }
     }
 }
@@ -96,7 +95,7 @@ mod tests {
     fn parses_function_parameters() {
         let source = "param($Value, [string]$Name)\nWrite-Output \"$Name=$Value\"";
         let parser = ParsedSource::parse(source).expect("valid source");
-        let function = FunctionDefinition::parse(&parser, source);
+        let function = FunctionDefinition::parse(&parser, parser.source());
 
         assert_eq!(
             function
@@ -106,6 +105,9 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["value", "name"]
         );
-        assert_eq!(function.body, "Write-Output \"$Name=$Value\"");
+        assert_eq!(
+            function.parser.text(function.body),
+            "Write-Output \"$Name=$Value\""
+        );
     }
 }

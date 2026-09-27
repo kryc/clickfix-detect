@@ -160,6 +160,13 @@ impl fmt::Display for Diagnostic {
 pub struct Tokenization {
     pub tokens: Vec<Token>,
     pub diagnostics: Vec<Diagnostic>,
+    pub(crate) nested: Vec<NestedTokenization>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct NestedTokenization {
+    pub(crate) span: Span,
+    pub(crate) tokens: Vec<Token>,
 }
 
 #[must_use]
@@ -185,6 +192,7 @@ pub struct Tokenizer<'a> {
     cursor: usize,
     tokens: Vec<Token>,
     diagnostics: Vec<Diagnostic>,
+    nested: Vec<NestedTokenization>,
     verbatim_mode: bool,
 }
 
@@ -196,6 +204,7 @@ impl<'a> Tokenizer<'a> {
             cursor: 0,
             tokens: Vec::new(),
             diagnostics: Vec::new(),
+            nested: Vec::new(),
             verbatim_mode: false,
         }
     }
@@ -209,6 +218,7 @@ impl<'a> Tokenizer<'a> {
         Tokenization {
             tokens: self.tokens,
             diagnostics: self.diagnostics,
+            nested: self.nested,
         }
     }
 
@@ -431,6 +441,20 @@ impl<'a> Tokenizer<'a> {
                 self.bump_char();
                 return true;
             }
+            if kind == StringKind::Expandable
+                && self.peek_char() == Some('$')
+                && self.peek_char_at(1) == Some('(')
+            {
+                self.bump_char();
+                self.bump_char();
+                let nested_start = self.cursor.saturating_sub(1);
+                if !self.scan_subexpression(1) {
+                    return false;
+                }
+                self.record_nested_tokens(nested_start, self.cursor);
+                at_line_start = false;
+                continue;
+            }
             let Some(character) = self.bump_char() else {
                 break;
             };
@@ -468,9 +492,12 @@ impl<'a> Tokenizer<'a> {
             }
             if kind == StringKind::Expandable && character == '$' && self.peek_char() == Some('(') {
                 self.bump_char();
+                let nested_start = self.cursor.saturating_sub(1);
                 if !self.scan_subexpression(depth + 1) {
                     return false;
                 }
+                let nested_end = self.cursor;
+                self.record_nested_tokens(nested_start, nested_end);
                 continue;
             }
             let closing = match kind {
@@ -914,6 +941,44 @@ impl<'a> Tokenizer<'a> {
         if digits > 0 && self.peek_char() == Some('}') {
             self.bump_char();
         }
+    }
+
+    fn record_nested_tokens(&mut self, start: usize, end: usize) {
+        if start >= end {
+            return;
+        }
+        let nested = Tokenizer::new(&self.source[start..end]).tokenize();
+        let tokens = nested
+            .tokens
+            .into_iter()
+            .map(|token| Token {
+                kind: token.kind,
+                span: Span::new(token.span.start + start, token.span.end + start),
+            })
+            .collect();
+        self.diagnostics
+            .extend(nested.diagnostics.into_iter().map(|diagnostic| Diagnostic {
+                kind: diagnostic.kind,
+                span: Span::new(diagnostic.span.start + start, diagnostic.span.end + start),
+                message: diagnostic.message,
+            }));
+        self.nested.push(NestedTokenization {
+            span: Span::new(start, end),
+            tokens,
+        });
+        self.nested.extend(nested.nested.into_iter().map(|nested| {
+            NestedTokenization {
+                span: Span::new(nested.span.start + start, nested.span.end + start),
+                tokens: nested
+                    .tokens
+                    .into_iter()
+                    .map(|token| Token {
+                        kind: token.kind,
+                        span: Span::new(token.span.start + start, token.span.end + start),
+                    })
+                    .collect(),
+            }
+        }));
     }
 
     fn starts_with(&self, value: &str) -> bool {

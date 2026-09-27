@@ -1,4 +1,5 @@
 mod archives;
+mod ast;
 mod bits;
 mod builtins;
 mod com;
@@ -9,6 +10,7 @@ mod engine_control;
 mod engine_expression;
 mod engine_operators;
 mod engine_support;
+mod expression_parser;
 mod parser;
 mod pipeline;
 mod provider_paths;
@@ -17,6 +19,7 @@ mod recon;
 mod redirection;
 mod runtime;
 mod security_cmdlets;
+mod statement_parser;
 mod syntax;
 mod transforms;
 mod value;
@@ -34,15 +37,13 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 use syntax::{
-    extract_delimited, find_switch, find_top_level_binary, find_word_case_insensitive, is_quoted,
-    is_variable, looks_like_script, named_or_positional, normalize_variable, parse_instance_call,
-    parse_member_access, parse_named_block, parse_number, parse_redirections, parse_static_call,
-    parse_static_member_access, quote_argument, split_assignment, split_compound_assignment,
-    split_increment, split_index_expression, split_key_value, split_labeled_blocks,
-    split_powershell_words, split_statements, split_top_level, split_windows_command_line,
-    starts_word, strip_balanced_outer, strip_comments, strip_prefix_case_insensitive,
-    trim_url_punctuation, NumberLiteral,
+    extract_delimited, find_switch, is_quoted, is_variable, looks_like_script, named_or_positional,
+    normalize_variable, parse_member_access, parse_number, parse_redirections,
+    parse_static_member_access, quote_argument, split_index_expression, split_powershell_words,
+    split_top_level, split_windows_command_line, trim_url_punctuation, NumberLiteral,
 };
+#[cfg(test)]
+use syntax::{split_statements, strip_comments};
 use thiserror::Error;
 use tokenizer::{StringKind, TokenKind};
 use transforms::{
@@ -67,6 +68,14 @@ static XML_ELEMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
 pub struct PowerShellResult {
     pub stdout: Vec<String>,
     pub last_value: Option<Value>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct PowerShellParseSummary {
+    pub bytes: usize,
+    pub tokens: usize,
+    pub statements: usize,
+    pub diagnostics: Vec<String>,
 }
 
 #[derive(Debug, Error)]
@@ -100,6 +109,26 @@ pub struct PowerShellEmulator {
 }
 
 impl PowerShellEmulator {
+    /// Tokenize and parse a `PowerShell` source document without evaluating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when lexical validation fails.
+    pub fn parse(script: &str) -> Result<PowerShellParseSummary, PowerShellError> {
+        let parsed = ParsedSource::parse(script)
+            .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
+        Ok(PowerShellParseSummary {
+            bytes: script.len(),
+            tokens: parsed.token_count(),
+            statements: parsed.program().statements.len(),
+            diagnostics: parsed
+                .diagnostics()
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+        })
+    }
+
     #[must_use]
     pub fn new() -> Self {
         let mut emulator = Self::default();
@@ -578,7 +607,7 @@ mod tests {
         let script =
             "$x = @\"\nline one; still data\nline two\n\"@\nWrite-Output $x\nWrite-Output 'a;b'";
         let parser = ParsedSource::parse(script).expect("valid source");
-        let statements = split_statements(&parser, script)
+        let statements = split_statements(&parser, parser.source())
             .into_iter()
             .filter(|statement| !statement.trim().is_empty())
             .collect::<Vec<_>>();
@@ -594,7 +623,7 @@ mod tests {
         let parser = ParsedSource::parse(statement).expect("valid source");
 
         assert_eq!(
-            strip_comments(&parser, statement).trim(),
+            strip_comments(&parser, parser.source()).trim(),
             r##"Write-Output "#safe""##
         );
     }
@@ -673,14 +702,14 @@ mod tests {
     fn evaluates_statements_inside_expandable_string_subexpressions() {
         let mut host = VirtualHost::new(AnalysisLimits::default());
         let mut emulator = PowerShellEmulator::new();
+        let source = "Write-Output \"result: $(if ($true) { 'yes' } else { 'no' })\"";
+        let parser = ParsedSource::parse(source).expect("valid source");
+        let nested = &parser.source()[parser.source().find("$(").unwrap() + 1..];
+        let (inner, _) = extract_delimited(&parser, nested, '(', ')').expect("subexpression");
+        assert!(syntax::starts_word(inner, "if"));
+        assert_eq!(parser.statements(inner).expect("statements").len(), 1);
 
-        emulator
-            .emulate(
-                "Write-Output \"result: $(if ($true) { 'yes' } else { 'no' })\"",
-                &mut host,
-                0,
-            )
-            .unwrap();
+        emulator.emulate(source, &mut host, 0).unwrap();
 
         assert_eq!(emulator.drain_stdout(), ["result: yes"]);
     }
@@ -689,11 +718,17 @@ mod tests {
     fn evaluates_here_strings_with_trailing_pipeline_syntax() {
         let mut host = VirtualHost::new(AnalysisLimits::default());
         let mut emulator = PowerShellEmulator::new();
+        let source = "Write-Output (@' \nsafe\n'@)";
 
-        emulator
-            .emulate("Write-Output (@' \nsafe\n'@)", &mut host, 0)
-            .unwrap();
+        emulator.emulate(source, &mut host, 0).unwrap();
 
         assert_eq!(emulator.drain_stdout(), ["safe"]);
+    }
+
+    #[test]
+    fn malformed_expression_ranges_do_not_panic() {
+        let source = "Write-Output x\n-gt 0) { Write-Output(($value -join ',') }";
+
+        assert!(PowerShellEmulator::parse(source).is_ok());
     }
 }

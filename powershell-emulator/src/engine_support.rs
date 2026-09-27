@@ -65,7 +65,7 @@ impl PowerShellEmulator {
 
     pub(crate) fn parse_string(
         &mut self,
-        _parser: &ParsedSource,
+        parser: &ParsedSource,
         expression: &str,
         host: &mut dyn Host,
         depth: usize,
@@ -86,10 +86,14 @@ impl PowerShellEmulator {
         if is_single_quote(opening_quote) {
             Ok(collapse_doubled_quotes(inner, is_single_quote))
         } else {
-            let unescaped = unescape_powershell(&collapse_doubled_quotes(inner, is_double_quote));
-            let parser = ParsedSource::parse(&unescaped)
-                .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
-            self.interpolate(&parser, parser.source(), host, depth)
+            let collapsed = collapse_doubled_quotes(inner, is_double_quote);
+            if collapsed == inner {
+                self.interpolate(parser, inner, host, depth)
+            } else {
+                let generated = ParsedSource::parse(&collapsed)
+                    .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
+                self.interpolate(&generated, generated.source(), host, depth)
+            }
         }
     }
 
@@ -136,12 +140,7 @@ impl PowerShellEmulator {
             .unwrap_or(body);
         Ok(Some(match kind {
             StringKind::Literal => body.into(),
-            StringKind::Expandable => {
-                let unescaped = unescape_powershell(body);
-                let parser = ParsedSource::parse(&unescaped)
-                    .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
-                self.interpolate(&parser, parser.source(), host, depth)?
-            }
+            StringKind::Expandable => self.interpolate(parser, body, host, depth)?,
         }))
     }
 
@@ -156,7 +155,7 @@ impl PowerShellEmulator {
         let mut cursor = 0;
         while let Some(relative_start) = input[cursor..].find("$(") {
             let start = cursor + relative_start;
-            expanded.push_str(&input[cursor..start]);
+            expanded.push_str(&unescape_powershell(&input[cursor..start]));
             let delimited = &input[start + 1..];
             let Some((inner, remainder)) = extract_delimited(parser, delimited, '(', ')') else {
                 expanded.push_str(&input[start..]);
@@ -188,7 +187,7 @@ impl PowerShellEmulator {
             let consumed = delimited.len().saturating_sub(remainder.len());
             cursor = start + 1 + consumed;
         }
-        expanded.push_str(&input[cursor..]);
+        expanded.push_str(&unescape_powershell(&input[cursor..]));
         Ok(VARIABLE_RE
             .replace_all(&expanded, |captures: &regex::Captures<'_>| {
                 let name = captures

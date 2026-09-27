@@ -431,16 +431,25 @@ them with local Bootstrap assets.
 ## Development
 
 The documented MSRV is Rust 1.85. PowerShell input is tokenized once into a
-validated, span-preserving source document. Statement, expression, command, and
-control-flow parsing operate on token ranges from that document. Lexical errors
-such as unterminated strings, here-strings, block comments, and braced variables
-stop emulation before behavioral interpretation. Nonfatal structural diagnostics
+validated, span-preserving source document and parsed into a typed AST.
+Statements, expressions, command arguments, functions, pipelines, redirection,
+and control flow retain source ranges into that document. The evaluator
+dispatches on AST nodes rather than reclassifying source strings.
+
+Nested `$()` expressions inside expandable strings retain nested token ranges in
+the same parsed document. Dynamically decoded, generated, or loaded scripts
+receive their own parsed document exactly once. Lexical errors such as
+unterminated strings, here-strings, block comments, and braced variables stop
+emulation before behavioral interpretation. Nonfatal structural diagnostics
 cover mismatched delimiters while still allowing conservative analysis.
 
 The tokenizer follows current PowerShell lexical behavior for nested
 subexpressions in expandable strings, here-string header/footer syntax, Unicode
 variables and whitespace, smart quotes, alternate dash characters,
 null-conditional operators, and the native-command `--%` stop-parsing token.
+
+`PowerShellEmulator::parse` exposes parse-only summary information without
+evaluating the source.
 
 ```console
 cargo fmt --all --check

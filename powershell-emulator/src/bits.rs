@@ -231,7 +231,7 @@ impl PowerShellEmulator {
         named_or_positional(arguments, names, position).map_or_else(
             || Ok(String::new()),
             |value| {
-                self.eval_expression(parser, &value, host, depth)
+                self.eval_expression(parser, value, host, depth)
                     .map(|value| value.as_string())
             },
         )
@@ -245,7 +245,7 @@ impl PowerShellEmulator {
         depth: usize,
     ) -> Result<Vec<String>, PowerShellError> {
         let value = named_or_positional(arguments, &["-bitsjob"], 0)
-            .map(|expression| self.eval_expression(parser, &expression, host, depth))
+            .map(|expression| self.eval_expression(parser, expression, host, depth))
             .transpose()?
             .or_else(|| self.variables.get("input").cloned());
         Ok(value.map_or_else(Vec::new, |value| bits_references(&value)))

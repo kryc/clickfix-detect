@@ -1,13 +1,11 @@
 use super::{
     com, decode_ascii, decode_base64, decode_utf16_be, decode_utf16_le, decode_utf8, dotnet,
-    encode_utf16_le, extract_delimited, find_top_level_binary, hex_decode, index_value, is_quoted,
-    is_variable, named_or_positional, normalize_variable, object_map, parse_instance_call,
-    parse_member_access, parse_number, parse_simple_xml, parse_static_call,
-    parse_static_member_access, percent_decode, split_index_expression, split_key_value,
-    split_powershell_words, split_statements, split_top_level, split_windows_command_line,
-    starts_word, strip_balanced_outer, strip_prefix_case_insensitive, transforms, Engine, Host,
-    NetworkIntent, NumberLiteral, PowerShellEmulator, PowerShellError, TokenKind, Value,
+    encode_utf16_le, hex_decode, index_value, named_or_positional, normalize_variable, object_map,
+    parse_number, parse_simple_xml, percent_decode, split_powershell_words, split_top_level,
+    split_windows_command_line, transforms, Engine, Host, NetworkIntent, NumberLiteral,
+    PowerShellEmulator, PowerShellError, Value,
 };
+use crate::ast::{Expression, ExpressionKind};
 use crate::parser::ParsedSource;
 
 fn static_member_default(
@@ -57,17 +55,33 @@ fn environment_value(host: &dyn Host, name: &str) -> Value {
         .map_or(Value::Null, |value| Value::String(value.into()))
 }
 
-fn is_cast_operand(rest: &str) -> bool {
-    let rest = rest.trim_start();
-    !rest.is_empty() && !rest.starts_with('.') && !rest.starts_with("::")
-}
-
 impl PowerShellEmulator {
-    #[allow(clippy::too_many_lines)]
     pub(crate) fn eval_expression(
         &mut self,
         parser: &ParsedSource,
         expression: &str,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<Value, PowerShellError> {
+        let expression = expression.trim();
+        if parser.window(expression).is_none() {
+            let generated = ParsedSource::parse(expression)
+                .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
+            return self.eval_expression(&generated, generated.source(), host, depth);
+        }
+        let parsed = parser.expression(expression).ok_or_else(|| {
+            PowerShellError::Evaluation(format!(
+                "expression is outside parsed source: {expression}"
+            ))
+        })?;
+        self.eval_parsed_expression(parser, &parsed, host, depth)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn eval_parsed_expression(
+        &mut self,
+        parser: &ParsedSource,
+        expression: &Expression,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
@@ -76,310 +90,266 @@ impl PowerShellEmulator {
             depth,
             "evaluating PowerShell expression",
         )?;
-        let expression = expression.trim();
-        if expression.is_empty() {
-            return Ok(Value::Null);
-        }
-        if parser.window(expression).is_none() {
-            let generated = ParsedSource::parse(expression)
-                .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
-            return self.eval_expression(&generated, generated.source(), host, depth);
-        }
-        if let Some(inner) = strip_balanced_outer(parser, expression, '(', ')') {
-            if self.looks_like_command_expression(parser, inner) {
-                return Ok(self
-                    .execute_statement(parser, inner, host, depth + 1)?
-                    .unwrap_or(Value::Null));
+        let text = parser.text(expression.range);
+        match &expression.kind {
+            ExpressionKind::Empty | ExpressionKind::Null => Ok(Value::Null),
+            ExpressionKind::Boolean(value) => Ok(Value::Bool(*value)),
+            ExpressionKind::Number => Ok(match parse_number(text) {
+                Some(NumberLiteral::Integer(value)) => Value::Number(value),
+                Some(NumberLiteral::Float(value)) => Value::Float(value),
+                None => Value::Null,
+            }),
+            ExpressionKind::Variable => Ok(self.variable_value(text, host)),
+            ExpressionKind::String(kind) => {
+                debug_assert!(matches!(
+                    kind,
+                    crate::tokenizer::StringKind::Literal
+                        | crate::tokenizer::StringKind::Expandable
+                ));
+                Ok(Value::String(self.parse_string(parser, text, host, depth)?))
             }
-            return self.eval_expression(parser, inner, host, depth);
+            ExpressionKind::HereString(kind) => {
+                debug_assert!(matches!(
+                    kind,
+                    crate::tokenizer::StringKind::Literal
+                        | crate::tokenizer::StringKind::Expandable
+                ));
+                Ok(self
+                    .parse_here_string(parser, text, host, depth)?
+                    .map_or(Value::Null, Value::String))
+            }
+            ExpressionKind::Parenthesized(inner) => {
+                let inner_text = parser.text(inner.range);
+                if matches!(inner.kind, ExpressionKind::Bare)
+                    && self.looks_like_command_expression(parser, inner_text)
+                {
+                    return Ok(self
+                        .execute_statement(parser, inner_text, host, depth + 1)?
+                        .unwrap_or(Value::Null));
+                }
+                self.eval_parsed_expression(parser, inner, host, depth)
+            }
+            ExpressionKind::Subexpression(range) => {
+                let (result, mut output) =
+                    self.execute_script_collect(parser, parser.text(*range), host, depth + 1)?;
+                Ok(if output.is_empty() {
+                    result.unwrap_or(Value::Null)
+                } else if output.len() == 1 {
+                    output.pop().unwrap_or(Value::Null)
+                } else {
+                    Value::Array(output)
+                })
+            }
+            ExpressionKind::Array(values) => values
+                .iter()
+                .map(|value| self.eval_parsed_expression(parser, value, host, depth))
+                .collect::<Result<Vec<_>, _>>()
+                .map(Value::Array),
+            ExpressionKind::Hashtable(entries) => {
+                let mut values = std::collections::BTreeMap::new();
+                for entry in entries {
+                    values.insert(
+                        entry.key.clone(),
+                        self.eval_parsed_expression(parser, &entry.value, host, depth)?,
+                    );
+                }
+                Ok(Value::Map(values))
+            }
+            ExpressionKind::ScriptBlock(range) => Ok(Value::Object(format!(
+                "ScriptBlock:{}",
+                parser.text(*range)
+            ))),
+            ExpressionKind::Cast { type_name, value } => {
+                let value = self.eval_parsed_expression(parser, value, host, depth)?;
+                Ok(Self::apply_ast_cast(type_name, value))
+            }
+            ExpressionKind::TypeLiteral(type_name) => {
+                Ok(Value::Object(format!("Type:{type_name}")))
+            }
+            ExpressionKind::Unary { operator, value } => {
+                let value = self.eval_parsed_expression(parser, value, host, depth)?;
+                if operator.eq_ignore_ascii_case("-join") {
+                    Ok(Value::String(match value {
+                        Value::Array(values) => values.iter().map(Value::as_string).collect(),
+                        other => other.as_string(),
+                    }))
+                } else {
+                    Ok(Self::apply_unary(operator, value))
+                }
+            }
+            ExpressionKind::Binary {
+                left,
+                operator,
+                right,
+            } => {
+                let left = self.eval_parsed_expression(parser, left, host, depth)?;
+                let right = self.eval_parsed_expression(parser, right, host, depth)?;
+                Ok(self.apply_binary(left, operator, right, host, depth))
+            }
+            ExpressionKind::Index {
+                value,
+                index,
+                null_conditional,
+            } => {
+                let value = self.eval_parsed_expression(parser, value, host, depth)?;
+                if *null_conditional && matches!(value, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let index = self.eval_parsed_expression(parser, index, host, depth)?;
+                Ok(index_value(value, index))
+            }
+            ExpressionKind::StaticMember { type_name, member } => {
+                let type_name = parser.text(*type_name);
+                let member = parser.text(*member);
+                let key = format!("__static:{}", type_name.to_ascii_lowercase());
+                if let Some(Value::Map(properties)) = self.variables.get(&key) {
+                    if let Some(value) = properties
+                        .iter()
+                        .find(|(name, _)| name.eq_ignore_ascii_case(member))
+                        .map(|(_, value)| value.clone())
+                    {
+                        return Ok(value);
+                    }
+                }
+                Ok(static_member_default(
+                    type_name,
+                    member,
+                    host,
+                    &self.current_location,
+                ))
+            }
+            ExpressionKind::StaticCall {
+                type_name,
+                method,
+                arguments,
+            } => {
+                let type_name = parser.text(*type_name);
+                let method_text = parser.text(*method);
+                let method = if matches!(
+                    parser
+                        .expression(method_text)
+                        .as_deref()
+                        .map(|expression| &expression.kind),
+                    Some(ExpressionKind::Variable)
+                ) {
+                    self.eval_expression(parser, method_text, host, depth)?
+                        .as_string()
+                } else {
+                    method_text.into()
+                };
+                let arguments = self.eval_ast_arguments(parser, arguments, host, depth)?;
+                self.eval_static_call_values(type_name, &method, &arguments, host, depth)
+            }
+            ExpressionKind::InstanceCall {
+                receiver,
+                method,
+                arguments,
+                null_conditional,
+            } => {
+                let receiver_text = parser.text(receiver.range);
+                let receiver_value = self.eval_parsed_expression(parser, receiver, host, depth)?;
+                if *null_conditional && matches!(receiver_value, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let method_text = parser.text(*method);
+                let method = if matches!(
+                    parser
+                        .expression(method_text)
+                        .as_deref()
+                        .map(|expression| &expression.kind),
+                    Some(ExpressionKind::Variable)
+                ) {
+                    self.eval_expression(parser, method_text, host, depth)?
+                        .as_string()
+                } else {
+                    method_text.into()
+                };
+                let arguments = self.eval_ast_arguments(parser, arguments, host, depth)?;
+                self.eval_instance_call_values(
+                    receiver_text,
+                    receiver_value,
+                    &method,
+                    &arguments,
+                    host,
+                    depth,
+                )
+            }
+            ExpressionKind::Member {
+                receiver,
+                member,
+                null_conditional,
+            } => {
+                let receiver = self.eval_parsed_expression(parser, receiver, host, depth)?;
+                if *null_conditional && matches!(receiver, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                Ok(Self::read_member(receiver, parser.text(*member)))
+            }
+            ExpressionKind::NewObject { arguments } => {
+                self.eval_new_object_spans(parser, arguments, host, depth)
+            }
+            ExpressionKind::Bare => Ok(Value::String(self.interpolate(parser, text, host, depth)?)),
         }
-        if let Some(inner) = expression
-            .strip_prefix("$(")
-            .and_then(|value| value.strip_suffix(')'))
+    }
+
+    fn variable_value(&self, expression: &str, host: &dyn Host) -> Value {
+        if let Some(name) = expression
+            .strip_prefix("$env:")
+            .or_else(|| expression.strip_prefix("$ENV:"))
         {
-            let (result, mut output) =
-                self.execute_script_collect(parser, inner, host, depth + 1)?;
-            return Ok(if output.is_empty() {
-                result.unwrap_or(Value::Null)
-            } else if output.len() == 1 {
-                output.pop().unwrap_or(Value::Null)
-            } else {
-                Value::Array(output)
-            });
+            return environment_value(host, name);
         }
-        if expression.eq_ignore_ascii_case("$true") {
-            return Ok(Value::Bool(true));
-        }
-        if expression.eq_ignore_ascii_case("$false") {
-            return Ok(Value::Bool(false));
-        }
-        if expression.eq_ignore_ascii_case("$null") {
-            return Ok(Value::Null);
-        }
-        if let Some(name) = expression.strip_prefix("$env:") {
-            return Ok(host
-                .environment(name)
-                .map_or(Value::Null, |value| Value::String(value.into())));
-        }
-        if is_variable(parser, expression) {
-            let name = normalize_variable(expression);
-            if let Some(value) = self.variables.get(&name).cloned() {
-                return Ok(value);
-            }
-            let automatic = match name.as_str() {
-                "home" => host
-                    .environment("userprofile")
-                    .map_or(Value::Null, |value| Value::String(value.into())),
+        let name = normalize_variable(expression);
+        self.variables
+            .get(&name)
+            .cloned()
+            .unwrap_or_else(|| match name.as_str() {
+                "home" => environment_value(host, "userprofile"),
                 "shellid" => Value::String("Microsoft.PowerShell".into()),
                 "host" => Value::Object("ConsoleHost".into()),
                 "lastexitcode" => Value::Number(0),
                 "?" => Value::Bool(true),
                 _ => Value::Null,
-            };
-            return Ok(automatic);
-        }
-        if is_quoted(parser, expression) {
-            return Ok(Value::String(
-                self.parse_string(parser, expression, host, depth)?,
-            ));
-        }
-        if let Some(value) = self.parse_here_string(parser, expression, host, depth)? {
-            return Ok(Value::String(value));
-        }
-        if let Some(number) = parse_number(expression) {
-            return Ok(match number {
-                NumberLiteral::Integer(value) => Value::Number(value),
-                NumberLiteral::Float(value) => Value::Float(value),
-            });
-        }
-        if let Some(inner) = expression
-            .strip_prefix("@(")
-            .and_then(|value| value.strip_suffix(')'))
-        {
-            return self.eval_array(parser, inner, host, depth);
-        }
-        if let Some((body, remainder)) = extract_delimited(parser, expression, '{', '}') {
-            if remainder.trim().is_empty() {
-                return Ok(Value::Object(format!("ScriptBlock:{body}")));
-            }
-        }
-        if expression.starts_with("@{") && expression.ends_with('}') {
-            return self.eval_hashtable(parser, &expression[2..expression.len() - 1], host, depth);
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "[char]") {
-            if is_cast_operand(rest) {
-                let value = self.eval_expression(parser, rest, host, depth)?;
-                let number = value.as_i64().and_then(|value| u32::try_from(value).ok());
-                return Ok(number
-                    .and_then(char::from_u32)
-                    .map_or(Value::Null, |character| {
-                        Value::String(character.to_string())
-                    }));
-            }
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "[char[]]") {
-            if is_cast_operand(rest) {
-                let value = self.eval_expression(parser, rest, host, depth)?;
-                return Ok(Value::Array(
-                    value
-                        .as_string()
-                        .chars()
-                        .map(|character| Value::String(character.to_string()))
-                        .collect(),
-                ));
-            }
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "[byte[]]") {
-            if is_cast_operand(rest) {
-                return Ok(Value::Bytes(
-                    self.eval_expression(parser, rest, host, depth)?.as_bytes(),
-                ));
-            }
-        }
-        if let Some(rest) = ["[int]", "[int32]", "[int64]", "[long]"]
-            .iter()
-            .find_map(|type_name| strip_prefix_case_insensitive(expression, type_name))
-        {
-            if is_cast_operand(rest) {
-                let value = self.eval_expression(parser, rest, host, depth)?;
-                return Ok(value.as_i64().map_or(Value::Null, Value::Number));
-            }
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "[string]") {
-            if is_cast_operand(rest) {
-                return Ok(Value::String(
-                    self.eval_expression(parser, rest, host, depth)?.as_string(),
-                ));
-            }
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "[pscustomobject]") {
-            return self.eval_expression(parser, rest, host, depth);
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "[xml]") {
-            let xml = self.eval_expression(parser, rest, host, depth)?.as_string();
-            return Ok(parse_simple_xml(&xml));
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "[regex]") {
-            if !rest.trim_start().starts_with("::") {
-                let pattern = self.eval_expression(parser, rest, host, depth)?.as_string();
-                return Ok(Value::Object(format!("Regex:{pattern}")));
-            }
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "[type]") {
-            if !rest.trim_start().starts_with("::") {
-                let type_name = self.eval_expression(parser, rest, host, depth)?.as_string();
-                return Ok(Value::Object(format!("Type:{type_name}")));
-            }
-        }
-        if expression.starts_with('[') && expression.ends_with(']') {
-            return Ok(Value::Object(format!(
-                "Type:{}",
-                expression[1..expression.len() - 1].trim()
-            )));
-        }
-        if let Some(rest) = strip_prefix_case_insensitive(expression, "-join") {
-            let value = self.eval_expression(parser, rest, host, depth)?;
-            return Ok(Value::String(match value {
-                Value::Array(values) => values.iter().map(Value::as_string).collect(),
-                other => other.as_string(),
-            }));
-        }
-        for operators in [
-            &["-or"][..],
-            &["-xor"][..],
-            &["-and"][..],
-            &[
-                "-eq",
-                "-ieq",
-                "-ceq",
-                "-ne",
-                "-ine",
-                "-cne",
-                "-lt",
-                "-le",
-                "-gt",
-                "-ge",
-                "-ilt",
-                "-ile",
-                "-igt",
-                "-ige",
-                "-clt",
-                "-cle",
-                "-cgt",
-                "-cge",
-                "-like",
-                "-ilike",
-                "-clike",
-                "-notlike",
-                "-inotlike",
-                "-cnotlike",
-                "-match",
-                "-imatch",
-                "-cmatch",
-                "-notmatch",
-                "-inotmatch",
-                "-cnotmatch",
-                "-contains",
-                "-icontains",
-                "-ccontains",
-                "-notcontains",
-                "-inotcontains",
-                "-cnotcontains",
-                "-in",
-                "-notin",
-                "-is",
-                "-isnot",
-            ][..],
-            &["-bor"][..],
-            &["-bxor"][..],
-            &["-band"][..],
-            &["-shl", "-shr"][..],
-            &[
-                "-replace",
-                "-ireplace",
-                "-creplace",
-                "-split",
-                "-isplit",
-                "-csplit",
-                "-join",
-                "-f",
-            ][..],
-            &["+", "-"][..],
-            &["*", "/", "%"][..],
-            &[".."][..],
-        ] {
-            if let Some((left, operator, right)) =
-                find_top_level_binary(parser, expression, operators)
-            {
-                let left_value = self.eval_expression(parser, left, host, depth)?;
-                let right_value = self.eval_expression(parser, right, host, depth)?;
-                return Ok(self.apply_binary(left_value, operator, right_value, host, depth));
-            }
-        }
-        for unary in ["-not", "!", "-bnot", "-", "+"] {
-            if let Some(rest) = strip_prefix_case_insensitive(expression, unary) {
-                if !rest.trim().is_empty() {
-                    let value = self.eval_expression(parser, rest, host, depth)?;
-                    return Ok(Self::apply_unary(unary, value));
-                }
-            }
-        }
-        if let Some((base, index)) = split_index_expression(parser, expression) {
-            let base = self.eval_expression(parser, base, host, depth)?;
-            let index = self.eval_expression(parser, index, host, depth)?;
-            return Ok(index_value(base, index));
-        }
-        if let Some((type_name, method, arguments)) = parse_static_call(parser, expression) {
-            let method = if is_variable(parser, &method) {
-                self.eval_expression(parser, &method, host, depth)?
-                    .as_string()
-            } else {
-                method
-            };
-            return self.eval_static_call(parser, &type_name, &method, &arguments, host, depth);
-        }
-        if let Some((type_name, member)) = parse_static_member_access(expression) {
-            let key = format!("__static:{}", type_name.to_ascii_lowercase());
-            if let Some(Value::Map(properties)) = self.variables.get(&key) {
-                if let Some(value) = properties
-                    .iter()
-                    .find(|(name, _)| name.eq_ignore_ascii_case(&member))
-                    .map(|(_, value)| value.clone())
-                {
-                    return Ok(value);
-                }
-            }
-            return Ok(static_member_default(
-                &type_name,
-                &member,
-                host,
-                &self.current_location,
-            ));
-        }
-        if let Some((receiver, method, arguments)) = parse_instance_call(parser, expression) {
-            let method = if is_variable(parser, &method) {
-                self.eval_expression(parser, &method, host, depth)?
-                    .as_string()
-            } else {
-                method
-            };
-            return self.eval_instance_call(parser, receiver, &method, &arguments, host, depth);
-        }
-        if let Some((receiver, member)) = parse_member_access(parser, expression) {
-            let receiver = self.eval_expression(parser, receiver, host, depth)?;
-            return Ok(Self::read_member(receiver, member));
-        }
-        if starts_word(expression, "new-object") {
-            return self.eval_new_object(parser, expression, host, depth);
-        }
-        let comma_values = split_top_level(parser, expression, ',');
-        if comma_values.len() > 1 {
-            return self.eval_array(parser, expression, host, depth);
-        }
+            })
+    }
 
-        Ok(Value::String(
-            self.interpolate(parser, expression, host, depth)?,
-        ))
+    fn apply_ast_cast(type_name: &str, value: Value) -> Value {
+        match type_name.to_ascii_lowercase().as_str() {
+            "char" => value
+                .as_i64()
+                .and_then(|value| u32::try_from(value).ok())
+                .and_then(char::from_u32)
+                .map_or(Value::Null, |character| {
+                    Value::String(character.to_string())
+                }),
+            "char[]" => Value::Array(
+                value
+                    .as_string()
+                    .chars()
+                    .map(|character| Value::String(character.to_string()))
+                    .collect(),
+            ),
+            "byte[]" => Value::Bytes(value.as_bytes()),
+            "int" | "int32" | "int64" | "long" => value.as_i64().map_or(Value::Null, Value::Number),
+            "string" => Value::String(value.as_string()),
+            "xml" => parse_simple_xml(&value.as_string()),
+            "regex" => Value::Object(format!("Regex:{}", value.as_string())),
+            "type" => Value::Object(format!("Type:{}", value.as_string())),
+            _ => value,
+        }
+    }
+
+    fn eval_ast_arguments(
+        &mut self,
+        parser: &ParsedSource,
+        arguments: &[Expression],
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<Vec<Value>, PowerShellError> {
+        arguments
+            .iter()
+            .map(|argument| self.eval_parsed_expression(parser, argument, host, depth))
+            .collect()
     }
 
     pub(crate) fn eval_statement_or_expression(
@@ -407,10 +377,38 @@ impl PowerShellEmulator {
         depth: usize,
     ) -> Result<Value, PowerShellError> {
         let words = split_powershell_words(parser, expression);
-        let arguments = words.get(1..).unwrap_or_default();
+        self.eval_new_object_arguments(parser, words.get(1..).unwrap_or_default(), host, depth)
+    }
+
+    fn eval_new_object_spans(
+        &mut self,
+        parser: &ParsedSource,
+        arguments: &[crate::tokenizer::Span],
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<Value, PowerShellError> {
+        let words = arguments
+            .iter()
+            .map(|range| crate::syntax::clean_line_continuations(parser.text(*range)))
+            .collect::<Vec<_>>();
+        let _bindings = words
+            .iter()
+            .zip(arguments.iter().copied())
+            .map(|(word, range)| parser.bind_external(word, range))
+            .collect::<Vec<_>>();
+        self.eval_new_object_arguments(parser, &words, host, depth)
+    }
+
+    fn eval_new_object_arguments(
+        &mut self,
+        parser: &ParsedSource,
+        arguments: &[String],
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<Value, PowerShellError> {
         if let Some(prog_id) = named_or_positional(arguments, &["-comobject"], usize::MAX) {
             let prog_id = if prog_id.starts_with(['$', '\'', '"', '(']) {
-                self.eval_expression(parser, &prog_id, host, depth)?
+                self.eval_expression(parser, prog_id, host, depth)?
                     .as_string()
             } else {
                 prog_id.trim_matches(['\'', '"']).into()
@@ -436,7 +434,7 @@ impl PowerShellEmulator {
             }
             "io.streamreader" => {
                 let data = if let Some(argument) = argument {
-                    self.eval_expression(parser, &argument, host, depth)?
+                    self.eval_expression(parser, argument, host, depth)?
                 } else {
                     Value::Null
                 };
@@ -446,7 +444,6 @@ impl PowerShellEmulator {
             | "io.compression.deflatestream"
             | "io.compression.zlibstream" => {
                 let data = argument
-                    .as_deref()
                     .map(|argument| self.eval_expression(parser, argument, host, depth))
                     .transpose()?
                     .unwrap_or(Value::Null);
@@ -463,43 +460,8 @@ impl PowerShellEmulator {
             }
             "net.webclient" | "system.net.webclient" => Ok(Value::Object("WebClient".into())),
             "random" | "system.random" => Ok(Value::Object("Random".into())),
-            _ => Ok(Value::Object(type_name)),
+            _ => Ok(Value::Object(type_name.into())),
         }
-    }
-
-    pub(crate) fn eval_array(
-        &mut self,
-        parser: &ParsedSource,
-        expression: &str,
-        host: &mut dyn Host,
-        depth: usize,
-    ) -> Result<Value, PowerShellError> {
-        split_top_level(parser, expression, ',')
-            .into_iter()
-            .filter(|item| !item.trim().is_empty())
-            .map(|item| self.eval_expression(parser, item.trim(), host, depth))
-            .collect::<Result<Vec<_>, _>>()
-            .map(Value::Array)
-    }
-
-    pub(crate) fn eval_hashtable(
-        &mut self,
-        parser: &ParsedSource,
-        expression: &str,
-        host: &mut dyn Host,
-        depth: usize,
-    ) -> Result<Value, PowerShellError> {
-        let mut values = std::collections::BTreeMap::new();
-        for statement in split_statements(parser, expression) {
-            for entry in split_top_level(parser, statement, ',') {
-                let Some((key, value)) = split_key_value(parser, entry) else {
-                    continue;
-                };
-                let key = key.trim().trim_matches(['\'', '"']).to_string();
-                values.insert(key, self.eval_expression(parser, value, host, depth)?);
-            }
-        }
-        Ok(Value::Map(values))
     }
 
     #[allow(clippy::too_many_lines)]
@@ -624,69 +586,12 @@ impl PowerShellEmulator {
         )
     }
 
-    pub(crate) fn looks_like_value_expression(parser: &ParsedSource, expression: &str) -> bool {
-        let words = split_powershell_words(parser, expression);
-        if words.len() > 1 {
-            let first = parser
-                .window(expression)
-                .into_iter()
-                .flat_map(|window| window.tokens().iter().copied())
-                .find(|token| !token.kind.is_trivia() && token.kind != TokenKind::NewLine);
-            if first.is_some_and(|token| {
-                matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword)
-            }) {
-                return false;
-            }
-        }
-        if is_quoted(parser, expression)
-            || is_variable(parser, expression)
-            || parse_number(expression).is_some()
-            || split_top_level(parser, expression, ',').len() > 1
-            || matches!(expression.chars().next(), Some('[' | '@' | '!' | '+' | '-'))
-        {
-            return true;
-        }
-        [
-            "-or",
-            "-xor",
-            "-and",
-            "-eq",
-            "-ne",
-            "-lt",
-            "-le",
-            "-gt",
-            "-ge",
-            "-like",
-            "-match",
-            "-contains",
-            "-in",
-            "-replace",
-            "-split",
-            "-join",
-            "-f",
-            "-band",
-            "-bor",
-            "-bxor",
-            "-shl",
-            "-shr",
-            "+",
-            "-",
-            "*",
-            "/",
-            "%",
-            "..",
-        ]
-        .iter()
-        .any(|operator| find_top_level_binary(parser, expression, &[*operator]).is_some())
-    }
-
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn eval_static_call(
+    #[allow(clippy::too_many_lines, clippy::unused_self)]
+    pub(crate) fn eval_static_call_values(
         &mut self,
-        parser: &ParsedSource,
         type_name: &str,
         method: &str,
-        arguments: &str,
+        args: &[Value],
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
@@ -695,9 +600,8 @@ impl PowerShellEmulator {
             .replace("System.", "")
             .to_ascii_lowercase();
         let normalized_method = method.to_ascii_lowercase();
-        let args = self.eval_call_arguments(parser, arguments, host, depth)?;
         if let dotnet::DotNetDispatch::Handled(value) =
-            Self::eval_extended_static_call(type_name, method, &args, host, depth)?
+            Self::eval_extended_static_call(type_name, method, args, host, depth)?
         {
             return Ok(value);
         }
@@ -800,20 +704,18 @@ impl PowerShellEmulator {
         }
     }
 
-    #[allow(clippy::too_many_lines)]
-    pub(crate) fn eval_instance_call(
+    #[allow(clippy::needless_pass_by_value, clippy::too_many_lines)]
+    pub(crate) fn eval_instance_call_values(
         &mut self,
-        parser: &ParsedSource,
         receiver_expression: &str,
+        receiver: Value,
         method: &str,
-        arguments: &str,
+        args: &[Value],
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
-        let receiver = self.eval_expression(parser, receiver_expression, host, depth)?;
-        let args = self.eval_call_arguments(parser, arguments, host, depth)?;
         if let com::ComDispatch::Handled(value) =
-            self.eval_com_instance_call(receiver_expression, &receiver, method, &args, host, depth)?
+            self.eval_com_instance_call(receiver_expression, &receiver, method, args, host, depth)?
         {
             return Ok(value);
         }
@@ -821,7 +723,7 @@ impl PowerShellEmulator {
             receiver_expression,
             &receiver,
             method,
-            &args,
+            args,
             host,
             depth,
         )? {
@@ -942,19 +844,5 @@ impl PowerShellEmulator {
                 Ok(Value::Null)
             }
         }
-    }
-
-    pub(crate) fn eval_call_arguments(
-        &mut self,
-        parser: &ParsedSource,
-        arguments: &str,
-        host: &mut dyn Host,
-        depth: usize,
-    ) -> Result<Vec<Value>, PowerShellError> {
-        split_top_level(parser, arguments, ',')
-            .into_iter()
-            .filter(|argument| !argument.trim().is_empty())
-            .map(|argument| self.eval_expression(parser, argument.trim(), host, depth))
-            .collect()
     }
 }

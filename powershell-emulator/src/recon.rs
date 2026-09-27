@@ -105,7 +105,7 @@ impl PowerShellEmulator {
             }
             "test-netconnection" | "tnc" => {
                 let host_name = named_or_positional(arguments, &["-computername", "-host"], 0)
-                    .unwrap_or_else(|| "example.invalid".into())
+                    .unwrap_or("example.invalid")
                     .trim_matches(['\'', '"'])
                     .to_string();
                 let port = named_or_positional(arguments, &["-port"], usize::MAX)

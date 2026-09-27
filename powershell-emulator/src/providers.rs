@@ -75,7 +75,7 @@ impl PowerShellEmulator {
                     depth,
                 )?;
                 let name = named_or_positional(arguments, &["-name"], 1)
-                    .map(|name| self.eval_expression(parser, &name, host, depth))
+                    .map(|name| self.eval_expression(parser, name, host, depth))
                     .transpose()?
                     .map(|name| name.as_string());
                 self.get_item_property(&path, name.as_deref(), host, depth)
@@ -90,9 +90,7 @@ impl PowerShellEmulator {
                     depth,
                 )?;
                 let name = named_or_positional(arguments, &["-name"], 1).unwrap_or_default();
-                let name = self
-                    .eval_expression(parser, &name, host, depth)?
-                    .as_string();
+                let name = self.eval_expression(parser, name, host, depth)?.as_string();
                 self.get_item_property(&path, Some(&name), host, depth)
                     .map(|value| Self::read_member(value, &name))
             }
@@ -107,9 +105,7 @@ impl PowerShellEmulator {
                 )?;
                 let name =
                     named_or_positional(arguments, &["-name"], usize::MAX).unwrap_or_default();
-                let name = self
-                    .eval_expression(parser, &name, host, depth)?
-                    .as_string();
+                let name = self.eval_expression(parser, name, host, depth)?.as_string();
                 let value = self.provider_value_argument(parser, arguments, 2, host, depth)?;
                 Some(self.set_item_property(&path, &name, value, host, depth))
             }
@@ -123,9 +119,7 @@ impl PowerShellEmulator {
                     depth,
                 )?;
                 let name = named_or_positional(arguments, &["-name"], 1).unwrap_or_default();
-                let name = self
-                    .eval_expression(parser, &name, host, depth)?
-                    .as_string();
+                let name = self.eval_expression(parser, name, host, depth)?.as_string();
                 Some(Value::Bool(
                     self.remove_item_property(&path, &name, host, depth),
                 ))
@@ -339,16 +333,15 @@ impl PowerShellEmulator {
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<String, PowerShellError> {
-        let expression =
-            named_or_positional(arguments, names, position).unwrap_or_else(|| ".".into());
+        let expression = named_or_positional(arguments, names, position).unwrap_or(".");
         if !expression.starts_with('$')
             && !expression.starts_with(['\'', '"'])
             && (expression.contains(':') || expression.starts_with(r"\\"))
         {
-            return Ok(expression);
+            return Ok(expression.into());
         }
         Ok(self
-            .eval_expression(parser, &expression, host, depth)?
+            .eval_expression(parser, expression, host, depth)?
             .as_string())
     }
 
@@ -360,9 +353,10 @@ impl PowerShellEmulator {
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
-        let expression = named_or_positional(arguments, &["-value"], usize::MAX)
-            .or_else(|| positional_argument(arguments, position))
-            .unwrap_or_default();
+        if let Some(expression) = named_or_positional(arguments, &["-value"], usize::MAX) {
+            return self.eval_expression(parser, expression, host, depth);
+        }
+        let expression = positional_argument(arguments, position).unwrap_or_default();
         self.eval_expression(parser, &expression, host, depth)
     }
 
@@ -403,7 +397,7 @@ impl PowerShellEmulator {
                         named_value_item(
                             "Function",
                             &target.path,
-                            Value::String(function.body.clone()),
+                            Value::String(function.parser.text(function.body).into()),
                         )
                     })
             }
@@ -661,7 +655,11 @@ impl PowerShellEmulator {
                 .functions
                 .iter()
                 .map(|(name, function)| {
-                    named_value_item("Function", name, Value::String(function.body.clone()))
+                    named_value_item(
+                        "Function",
+                        name,
+                        Value::String(function.parser.text(function.body).into()),
+                    )
                 })
                 .collect(),
             Provider::Registry => Self::registry_children(&target.path, recurse, host, depth),

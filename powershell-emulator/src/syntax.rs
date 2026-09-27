@@ -302,6 +302,7 @@ pub(crate) fn split_labeled_blocks<'a>(
     blocks
 }
 
+#[allow(dead_code)]
 pub(crate) fn strip_comments<'a>(parser: &'a ParsedSource, input: &'a str) -> Cow<'a, str> {
     let Some(window) = parser.window(input) else {
         return Cow::Borrowed(input);
@@ -421,6 +422,16 @@ fn split_top_level_many<'a>(
 }
 
 pub(crate) fn split_powershell_words(parser: &ParsedSource, input: &str) -> Vec<String> {
+    split_powershell_word_ranges(parser, input)
+        .into_iter()
+        .map(|range| clean_line_continuations(parser.text(range)))
+        .collect()
+}
+
+pub(crate) fn split_powershell_word_ranges(
+    parser: &ParsedSource,
+    input: &str,
+) -> Vec<crate::tokenizer::Span> {
     let Some(window) = parser.window(input) else {
         return Vec::new();
     };
@@ -438,9 +449,7 @@ pub(crate) fn split_powershell_words(parser: &ParsedSource, input: &str) -> Vec<
             );
         if top_level_separator {
             if let Some(word_start) = start.take() {
-                words.push(clean_line_continuations(
-                    parser.text(crate::tokenizer::Span::new(word_start, end)),
-                ));
+                words.push(crate::tokenizer::Span::new(word_start, end));
             }
             if token.kind == TokenKind::Comment(CommentKind::Line) {
                 break;
@@ -456,9 +465,7 @@ pub(crate) fn split_powershell_words(parser: &ParsedSource, input: &str) -> Vec<
         nesting.observe(token.kind);
     }
     if let Some(word_start) = start {
-        words.push(clean_line_continuations(
-            parser.text(crate::tokenizer::Span::new(word_start, end)),
-        ));
+        words.push(crate::tokenizer::Span::new(word_start, end));
     }
     words
 }
@@ -501,7 +508,7 @@ pub(crate) fn extract_delimited<'a>(
     close: char,
 ) -> Option<(&'a str, &'a str)> {
     let input = input.trim_start();
-    let window = parser.window(input)?;
+    let window = parser.window_starting_at(input)?;
     let open_kind = delimiter_kind(open)?;
     let close_kind = delimiter_kind(close)?;
     let first = window
@@ -577,7 +584,7 @@ fn token_matches_separator(token: Token, input: &str, separators: &[char]) -> bo
     }
 }
 
-fn clean_line_continuations(input: &str) -> String {
+pub(crate) fn clean_line_continuations(input: &str) -> String {
     input.trim().replace("`\r\n", "").replace("`\n", "")
 }
 
@@ -790,10 +797,10 @@ pub(crate) fn split_index_expression<'a>(
     None
 }
 
-pub(crate) fn parse_static_call(
-    parser: &ParsedSource,
+pub(crate) fn parse_static_call<'a>(
+    parser: &'a ParsedSource,
     input: &str,
-) -> Option<(String, String, String)> {
+) -> Option<(&'a str, &'a str, &'a str)> {
     let input = input.trim();
     let window = parser.window(input)?;
     let significant = window
@@ -834,8 +841,7 @@ pub(crate) fn parse_static_call(
             first.span.end,
             close.span.start,
         ))
-        .trim()
-        .to_string();
+        .trim();
     let call = parser
         .text(crate::tokenizer::Span::new(
             static_operator.span.end,
@@ -851,18 +857,15 @@ pub(crate) fn parse_static_call(
         type_name,
         parser
             .text(crate::tokenizer::Span::new(call_window.span().start, open))
-            .trim()
-            .to_string(),
-        parser
-            .text(crate::tokenizer::Span::new(
-                open + 1,
-                call_window.span().end - 1,
-            ))
-            .to_string(),
+            .trim(),
+        parser.text(crate::tokenizer::Span::new(
+            open + 1,
+            call_window.span().end - 1,
+        )),
     ))
 }
 
-pub(crate) fn parse_static_member_access(input: &str) -> Option<(String, String)> {
+pub(crate) fn parse_static_member_access(input: &str) -> Option<(&str, &str)> {
     let input = input.trim();
     if input.ends_with(')') {
         return None;
@@ -875,13 +878,13 @@ pub(crate) fn parse_static_member_access(input: &str) -> Option<(String, String)
         && member
             .chars()
             .all(|character| character.is_ascii_alphanumeric() || character == '_'))
-    .then(|| (type_name.into(), member.into()))
+    .then_some((type_name, member))
 }
 
 pub(crate) fn parse_instance_call<'a>(
     parser: &'a ParsedSource,
     input: &str,
-) -> Option<(&'a str, String, String)> {
+) -> Option<(&'a str, &'a str, &'a str)> {
     if !input.ends_with(')') {
         return None;
     }
@@ -895,11 +898,8 @@ pub(crate) fn parse_instance_call<'a>(
             .trim(),
         parser
             .text(crate::tokenizer::Span::new(dot + 1, open))
-            .trim()
-            .to_string(),
-        parser
-            .text(crate::tokenizer::Span::new(open + 1, window.span().end - 1))
-            .to_string(),
+            .trim(),
+        parser.text(crate::tokenizer::Span::new(open + 1, window.span().end - 1)),
     ))
 }
 
@@ -949,17 +949,17 @@ fn find_last_top_level_dot(parser: &ParsedSource, input: &str) -> Option<usize> 
     result
 }
 
-pub(crate) fn named_or_positional(
-    arguments: &[String],
+pub(crate) fn named_or_positional<'a>(
+    arguments: &'a [String],
     names: &[&str],
     position: usize,
-) -> Option<String> {
+) -> Option<&'a str> {
     for (index, argument) in arguments.iter().enumerate() {
         if let Some(value) = inline_parameter_value(argument, names) {
             return Some(value);
         }
         if parameter_matches_any(argument, names) {
-            return arguments.get(index + 1).cloned();
+            return arguments.get(index + 1).map(String::as_str);
         }
     }
     if position == usize::MAX {
@@ -991,12 +991,12 @@ fn parameter_matches_any(argument: &str, names: &[&str]) -> bool {
     matches == 1
 }
 
-fn inline_parameter_value(argument: &str, names: &[&str]) -> Option<String> {
+fn inline_parameter_value<'a>(argument: &'a str, names: &[&str]) -> Option<&'a str> {
     let (name, value) = argument.split_once(':')?;
-    parameter_matches_any(name, names).then(|| value.into())
+    parameter_matches_any(name, names).then_some(value)
 }
 
-fn positional_arguments(arguments: &[String]) -> Vec<String> {
+fn positional_arguments(arguments: &[String]) -> Vec<&str> {
     let mut positional = Vec::new();
     let mut index = 0;
     while index < arguments.len() {
@@ -1012,7 +1012,7 @@ fn positional_arguments(arguments: &[String]) -> Vec<String> {
                 index += 1;
             }
         } else {
-            positional.push(argument.clone());
+            positional.push(argument.as_str());
             index += 1;
         }
     }

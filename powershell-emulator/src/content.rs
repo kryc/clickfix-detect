@@ -40,10 +40,10 @@ impl PowerShellEmulator {
                         .unwrap_or_default();
                 let value_expression =
                     named_or_positional(arguments, &["-value", "-inputobject"], 1);
-                let path = self.eval_content_path(parser, &path_expression, host, depth)?;
+                let path = self.eval_content_path(parser, path_expression, host, depth)?;
                 let target = self.resolve_provider_path(&path);
                 let value = if let Some(expression) = value_expression {
-                    self.eval_expression(parser, &expression, host, depth)?
+                    self.eval_expression(parser, expression, host, depth)?
                 } else {
                     self.variables.get("input").cloned().unwrap_or(Value::Null)
                 };
@@ -51,7 +51,7 @@ impl PowerShellEmulator {
                 let text = content_records(&value, no_newline);
                 let explicit_encoding = named_or_positional(arguments, &["-encoding"], usize::MAX);
                 let encoding = parse_encoding(
-                    explicit_encoding.as_deref(),
+                    explicit_encoding,
                     if command == "out-file" {
                         TextEncoding::Utf16Le
                     } else {
@@ -71,14 +71,13 @@ impl PowerShellEmulator {
             "get-content" => {
                 let path_expression = named_or_positional(arguments, &["-path", "-literalpath"], 0)
                     .unwrap_or_default();
-                let path = self.eval_content_path(parser, &path_expression, host, depth)?;
+                let path = self.eval_content_path(parser, path_expression, host, depth)?;
                 let target = self.resolve_provider_path(&path);
                 let explicit_encoding = named_or_positional(arguments, &["-encoding"], usize::MAX);
                 let value = host
                     .read_file(&target.path, Engine::PowerShell, depth)
                     .map_or(Value::Null, |bytes| {
                         let encoding = explicit_encoding
-                            .as_deref()
                             .map(|value| parse_encoding(Some(value), TextEncoding::Utf8));
                         let text = decode_text(&bytes, encoding);
                         if find_switch(arguments, "-raw").is_some() {

@@ -62,7 +62,7 @@ impl PowerShellEmulator {
             )),
             "set-executionpolicy" => {
                 let policy = named_or_positional(arguments, &["-executionpolicy"], 0)
-                    .unwrap_or_else(|| "Restricted".into())
+                    .unwrap_or("Restricted")
                     .trim_matches(['\'', '"'])
                     .to_string();
                 self.variables
@@ -239,7 +239,8 @@ impl PowerShellEmulator {
                         "At".into(),
                         Value::String(
                             named_or_positional(arguments, &["-at"], usize::MAX)
-                                .unwrap_or_default(),
+                                .unwrap_or_default()
+                                .into(),
                         ),
                     ),
                 ]
@@ -255,14 +256,17 @@ impl PowerShellEmulator {
                     (
                         "UserId".into(),
                         Value::String(
-                            named_or_positional(arguments, &["-userid"], 0).unwrap_or_default(),
+                            named_or_positional(arguments, &["-userid"], 0)
+                                .unwrap_or_default()
+                                .into(),
                         ),
                     ),
                     (
                         "RunLevel".into(),
                         Value::String(
                             named_or_positional(arguments, &["-runlevel"], usize::MAX)
-                                .unwrap_or_else(|| "Limited".into()),
+                                .unwrap_or("Limited")
+                                .into(),
                         ),
                     ),
                 ]
@@ -285,7 +289,7 @@ impl PowerShellEmulator {
             )),
             "register-scheduledtask" => {
                 let name = named_or_positional(arguments, &["-taskname"], 0)
-                    .unwrap_or_else(|| "UnnamedTask".into())
+                    .unwrap_or("UnnamedTask")
                     .trim_matches(['\'', '"'])
                     .to_string();
                 host.write_registry(
@@ -298,14 +302,14 @@ impl PowerShellEmulator {
             }
             "get-scheduledtask" => {
                 let name = named_or_positional(arguments, &["-taskname"], 0)
-                    .unwrap_or_else(|| "ModeledTask".into())
+                    .unwrap_or("ModeledTask")
                     .trim_matches(['\'', '"'])
                     .to_string();
                 Some(scheduled_task_value(&name, "Ready"))
             }
             "start-scheduledtask" | "unregister-scheduledtask" => {
                 let name = named_or_positional(arguments, &["-taskname"], 0)
-                    .unwrap_or_else(|| "ModeledTask".into())
+                    .unwrap_or("ModeledTask")
                     .trim_matches(['\'', '"'])
                     .to_string();
                 host.unsupported(

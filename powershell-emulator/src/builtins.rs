@@ -25,7 +25,9 @@ impl PowerShellEmulator {
         let value = match command {
             "new-object" => Some(self.eval_new_object(parser, statement, host, depth)?),
             "foreach-object" => {
-                let body = script_block(parser, arguments)?;
+                let body = script_block(parser, arguments).ok_or_else(|| {
+                    PowerShellError::Evaluation("ForEach-Object requires a script block".into())
+                })?;
                 let values = pipeline_values(self.variables.get("input").cloned());
                 let mut output = Vec::new();
                 for (index, value) in values.into_iter().enumerate() {
@@ -40,21 +42,21 @@ impl PowerShellEmulator {
                     }
                     self.variables.insert("_".into(), value.clone());
                     self.variables.insert("psitem".into(), value);
-                    let (_, values) =
-                        self.execute_script_collect(&body, body.source(), host, depth + 1)?;
+                    let (_, values) = self.execute_script_collect(parser, body, host, depth + 1)?;
                     output.extend(values);
                 }
                 Some(Value::Array(output))
             }
             "where-object" => {
-                let body = script_block(parser, arguments)?;
+                let body = script_block(parser, arguments).ok_or_else(|| {
+                    PowerShellError::Evaluation("Where-Object requires a script block".into())
+                })?;
                 let values = pipeline_values(self.variables.get("input").cloned());
                 let mut output = Vec::new();
                 for value in values {
                     self.variables.insert("_".into(), value.clone());
                     self.variables.insert("psitem".into(), value.clone());
-                    let (result, _) =
-                        self.execute_script_collect(&body, body.source(), host, depth + 1)?;
+                    let (result, _) = self.execute_script_collect(parser, body, host, depth + 1)?;
                     if result.is_some_and(|result| result.truthy()) {
                         output.push(value);
                     }
@@ -298,7 +300,7 @@ impl PowerShellEmulator {
                     .to_ascii_lowercase();
                 let value_expression =
                     named_or_positional(arguments, &["-value"], 1).unwrap_or_default();
-                let value = self.eval_expression(parser, &value_expression, host, depth)?;
+                let value = self.eval_expression(parser, value_expression, host, depth)?;
                 self.variables.insert(name, value.clone());
                 Some(value)
             }
@@ -306,10 +308,10 @@ impl PowerShellEmulator {
                 let parent = named_or_positional(arguments, &["-path"], 0).unwrap_or_default();
                 let child = named_or_positional(arguments, &["-childpath"], 1).unwrap_or_default();
                 let parent = self
-                    .eval_expression(parser, &parent, host, depth)?
+                    .eval_expression(parser, parent, host, depth)?
                     .as_string();
                 let child = self
-                    .eval_expression(parser, &child, host, depth)?
+                    .eval_expression(parser, child, host, depth)?
                     .as_string();
                 Some(Value::String(format!(
                     "{}\\{}",
@@ -319,9 +321,7 @@ impl PowerShellEmulator {
             }
             "split-path" => {
                 let path = named_or_positional(arguments, &["-path"], 0).unwrap_or_default();
-                let path = self
-                    .eval_expression(parser, &path, host, depth)?
-                    .as_string();
+                let path = self.eval_expression(parser, path, host, depth)?.as_string();
                 if find_switch(arguments, "-leaf").is_some() {
                     Some(Value::String(
                         path.rsplit(['\\', '/']).next().unwrap_or_default().into(),
@@ -336,9 +336,7 @@ impl PowerShellEmulator {
             "resolve-path" => {
                 let path = named_or_positional(arguments, &["-path", "-literalpath"], 0)
                     .unwrap_or_default();
-                let path = self
-                    .eval_expression(parser, &path, host, depth)?
-                    .as_string();
+                let path = self.eval_expression(parser, path, host, depth)?.as_string();
                 Some(Value::Map(
                     [("Path".into(), Value::String(path))].into_iter().collect(),
                 ))
@@ -346,9 +344,7 @@ impl PowerShellEmulator {
             "test-path" => {
                 let path = named_or_positional(arguments, &["-path", "-literalpath"], 0)
                     .unwrap_or_default();
-                let path = self
-                    .eval_expression(parser, &path, host, depth)?
-                    .as_string();
+                let path = self.eval_expression(parser, path, host, depth)?.as_string();
                 Some(Value::Bool(
                     host.read_file(&path, Engine::PowerShell, depth).is_some(),
                 ))
@@ -359,10 +355,10 @@ impl PowerShellEmulator {
                 let destination =
                     named_or_positional(arguments, &["-destination"], 1).unwrap_or_default();
                 let source = self
-                    .eval_expression(parser, &source, host, depth)?
+                    .eval_expression(parser, source, host, depth)?
                     .as_string();
                 let destination = self
-                    .eval_expression(parser, &destination, host, depth)?
+                    .eval_expression(parser, destination, host, depth)?
                     .as_string();
                 let result = self.copy_filesystem_item(
                     &source,
@@ -384,10 +380,10 @@ impl PowerShellEmulator {
                     .unwrap_or_default();
                 let new_name = named_or_positional(arguments, &["-newname"], 1).unwrap_or_default();
                 let source = self
-                    .eval_expression(parser, &source, host, depth)?
+                    .eval_expression(parser, source, host, depth)?
                     .as_string();
                 let new_name = self
-                    .eval_expression(parser, &new_name, host, depth)?
+                    .eval_expression(parser, new_name, host, depth)?
                     .as_string();
                 let parent = source
                     .rsplit_once(['\\', '/'])
@@ -411,10 +407,10 @@ impl PowerShellEmulator {
                 let destination =
                     named_or_positional(arguments, &["-destinationpath"], 1).unwrap_or_default();
                 let archive = self
-                    .eval_expression(parser, &archive, host, depth)?
+                    .eval_expression(parser, archive, host, depth)?
                     .as_string();
                 let destination = self
-                    .eval_expression(parser, &destination, host, depth)?
+                    .eval_expression(parser, destination, host, depth)?
                     .as_string();
                 let Some(bytes) = host.read_file(&archive, Engine::PowerShell, depth) else {
                     return Ok(BuiltinDispatch::Handled(Some(Value::Null)));
@@ -452,10 +448,10 @@ impl PowerShellEmulator {
                 let destination =
                     named_or_positional(arguments, &["-destinationpath"], 1).unwrap_or_default();
                 let source = self
-                    .eval_expression(parser, &source, host, depth)?
+                    .eval_expression(parser, source, host, depth)?
                     .as_string();
                 let destination = self
-                    .eval_expression(parser, &destination, host, depth)?
+                    .eval_expression(parser, destination, host, depth)?
                     .as_string();
                 let Some(bytes) = host.read_file(&source, Engine::PowerShell, depth) else {
                     return Ok(BuiltinDispatch::Handled(Some(Value::Null)));
@@ -470,12 +466,10 @@ impl PowerShellEmulator {
                 let path = named_or_positional(arguments, &["-path", "-literalpath"], 0)
                     .unwrap_or_default();
                 let algorithm = named_or_positional(arguments, &["-algorithm"], usize::MAX)
-                    .unwrap_or_else(|| "SHA256".into())
+                    .unwrap_or("SHA256")
                     .trim_matches(['\'', '"'])
                     .to_ascii_uppercase();
-                let path = self
-                    .eval_expression(parser, &path, host, depth)?
-                    .as_string();
+                let path = self.eval_expression(parser, path, host, depth)?.as_string();
                 let Some(bytes) = host.read_file(&path, Engine::PowerShell, depth) else {
                     return Ok(BuiltinDispatch::Handled(Some(Value::Null)));
                 };
@@ -497,9 +491,9 @@ impl PowerShellEmulator {
             }
             "add-type" => {
                 let source = named_or_positional(arguments, &["-typedefinition"], 0)
-                    .unwrap_or_else(|| arguments.join(" "));
+                    .map_or_else(|| arguments.join(" "), str::to_owned);
                 let source = self
-                    .eval_expression(parser, &source, host, depth)?
+                    .eval_expression(parser, source.as_str(), host, depth)?
                     .as_string();
                 host.add_artifact(
                     ArtifactKind::Script,
@@ -577,7 +571,7 @@ impl PowerShellEmulator {
                 if method.eq_ignore_ascii_case("Create") {
                     let command_line =
                         named_or_positional(arguments, &["-arguments"], 0).unwrap_or_default();
-                    let words = crate::syntax::split_windows_command_line(&command_line);
+                    let words = crate::syntax::split_windows_command_line(command_line);
                     if let Some(program) = words.first() {
                         Self::spawn(
                             program,
@@ -617,15 +611,9 @@ fn pipeline_values(value: Option<Value>) -> Vec<Value> {
     }
 }
 
-fn script_block(
-    parser: &ParsedSource,
-    arguments: &[String],
-) -> Result<ParsedSource, PowerShellError> {
-    let expression = arguments.join(" ");
-    let source = extract_delimited(parser, expression.trim(), '{', '}')
-        .map_or(expression, |(body, _)| body.into());
-    ParsedSource::parse(&source)
-        .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))
+fn script_block<'a>(parser: &'a ParsedSource, arguments: &[String]) -> Option<&'a str> {
+    let expression = arguments.first()?;
+    extract_delimited(parser, expression.trim(), '{', '}').map(|(body, _)| body)
 }
 
 fn numeric_argument(arguments: &[String], names: &[&str]) -> Option<usize> {
