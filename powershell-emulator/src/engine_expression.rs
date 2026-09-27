@@ -5,9 +5,10 @@ use super::{
     parse_member_access, parse_number, parse_simple_xml, parse_static_call,
     parse_static_member_access, percent_decode, split_index_expression, split_key_value,
     split_powershell_words, split_statements, split_top_level, split_windows_command_line,
-    starts_word, strip_balanced_outer, strip_prefix_case_insensitive, tokenize, transforms, Engine,
-    Host, NetworkIntent, NumberLiteral, PowerShellEmulator, PowerShellError, TokenKind, Value,
+    starts_word, strip_balanced_outer, strip_prefix_case_insensitive, transforms, Engine, Host,
+    NetworkIntent, NumberLiteral, PowerShellEmulator, PowerShellError, TokenKind, Value,
 };
+use crate::parser::ParsedSource;
 
 fn static_member_default(
     type_name: &str,
@@ -65,6 +66,7 @@ impl PowerShellEmulator {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn eval_expression(
         &mut self,
+        parser: &ParsedSource,
         expression: &str,
         host: &mut dyn Host,
         depth: usize,
@@ -78,19 +80,25 @@ impl PowerShellEmulator {
         if expression.is_empty() {
             return Ok(Value::Null);
         }
-        if let Some(inner) = strip_balanced_outer(expression, '(', ')') {
-            if self.looks_like_command_expression(inner) {
+        if parser.window(expression).is_none() {
+            let generated = ParsedSource::parse(expression)
+                .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
+            return self.eval_expression(&generated, generated.source(), host, depth);
+        }
+        if let Some(inner) = strip_balanced_outer(parser, expression, '(', ')') {
+            if self.looks_like_command_expression(parser, inner) {
                 return Ok(self
-                    .execute_statement(inner, host, depth + 1)?
+                    .execute_statement(parser, inner, host, depth + 1)?
                     .unwrap_or(Value::Null));
             }
-            return self.eval_expression(inner, host, depth);
+            return self.eval_expression(parser, inner, host, depth);
         }
         if let Some(inner) = expression
             .strip_prefix("$(")
             .and_then(|value| value.strip_suffix(')'))
         {
-            let (result, mut output) = self.execute_script_collect(inner, host, depth + 1)?;
+            let (result, mut output) =
+                self.execute_script_collect(parser, inner, host, depth + 1)?;
             return Ok(if output.is_empty() {
                 result.unwrap_or(Value::Null)
             } else if output.len() == 1 {
@@ -113,7 +121,7 @@ impl PowerShellEmulator {
                 .environment(name)
                 .map_or(Value::Null, |value| Value::String(value.into())));
         }
-        if is_variable(expression) {
+        if is_variable(parser, expression) {
             let name = normalize_variable(expression);
             if let Some(value) = self.variables.get(&name).cloned() {
                 return Ok(value);
@@ -130,10 +138,12 @@ impl PowerShellEmulator {
             };
             return Ok(automatic);
         }
-        if is_quoted(expression) {
-            return Ok(Value::String(self.parse_string(expression, host, depth)?));
+        if is_quoted(parser, expression) {
+            return Ok(Value::String(
+                self.parse_string(parser, expression, host, depth)?,
+            ));
         }
-        if let Some(value) = self.parse_here_string(expression, host, depth)? {
+        if let Some(value) = self.parse_here_string(parser, expression, host, depth)? {
             return Ok(Value::String(value));
         }
         if let Some(number) = parse_number(expression) {
@@ -146,19 +156,19 @@ impl PowerShellEmulator {
             .strip_prefix("@(")
             .and_then(|value| value.strip_suffix(')'))
         {
-            return self.eval_array(inner, host, depth);
+            return self.eval_array(parser, inner, host, depth);
         }
-        if let Some((body, remainder)) = extract_delimited(expression, '{', '}') {
+        if let Some((body, remainder)) = extract_delimited(parser, expression, '{', '}') {
             if remainder.trim().is_empty() {
                 return Ok(Value::Object(format!("ScriptBlock:{body}")));
             }
         }
         if expression.starts_with("@{") && expression.ends_with('}') {
-            return self.eval_hashtable(&expression[2..expression.len() - 1], host, depth);
+            return self.eval_hashtable(parser, &expression[2..expression.len() - 1], host, depth);
         }
         if let Some(rest) = strip_prefix_case_insensitive(expression, "[char]") {
             if is_cast_operand(rest) {
-                let value = self.eval_expression(rest, host, depth)?;
+                let value = self.eval_expression(parser, rest, host, depth)?;
                 let number = value.as_i64().and_then(|value| u32::try_from(value).ok());
                 return Ok(number
                     .and_then(char::from_u32)
@@ -169,7 +179,7 @@ impl PowerShellEmulator {
         }
         if let Some(rest) = strip_prefix_case_insensitive(expression, "[char[]]") {
             if is_cast_operand(rest) {
-                let value = self.eval_expression(rest, host, depth)?;
+                let value = self.eval_expression(parser, rest, host, depth)?;
                 return Ok(Value::Array(
                     value
                         .as_string()
@@ -182,7 +192,7 @@ impl PowerShellEmulator {
         if let Some(rest) = strip_prefix_case_insensitive(expression, "[byte[]]") {
             if is_cast_operand(rest) {
                 return Ok(Value::Bytes(
-                    self.eval_expression(rest, host, depth)?.as_bytes(),
+                    self.eval_expression(parser, rest, host, depth)?.as_bytes(),
                 ));
             }
         }
@@ -191,33 +201,33 @@ impl PowerShellEmulator {
             .find_map(|type_name| strip_prefix_case_insensitive(expression, type_name))
         {
             if is_cast_operand(rest) {
-                let value = self.eval_expression(rest, host, depth)?;
+                let value = self.eval_expression(parser, rest, host, depth)?;
                 return Ok(value.as_i64().map_or(Value::Null, Value::Number));
             }
         }
         if let Some(rest) = strip_prefix_case_insensitive(expression, "[string]") {
             if is_cast_operand(rest) {
                 return Ok(Value::String(
-                    self.eval_expression(rest, host, depth)?.as_string(),
+                    self.eval_expression(parser, rest, host, depth)?.as_string(),
                 ));
             }
         }
         if let Some(rest) = strip_prefix_case_insensitive(expression, "[pscustomobject]") {
-            return self.eval_expression(rest, host, depth);
+            return self.eval_expression(parser, rest, host, depth);
         }
         if let Some(rest) = strip_prefix_case_insensitive(expression, "[xml]") {
-            let xml = self.eval_expression(rest, host, depth)?.as_string();
+            let xml = self.eval_expression(parser, rest, host, depth)?.as_string();
             return Ok(parse_simple_xml(&xml));
         }
         if let Some(rest) = strip_prefix_case_insensitive(expression, "[regex]") {
             if !rest.trim_start().starts_with("::") {
-                let pattern = self.eval_expression(rest, host, depth)?.as_string();
+                let pattern = self.eval_expression(parser, rest, host, depth)?.as_string();
                 return Ok(Value::Object(format!("Regex:{pattern}")));
             }
         }
         if let Some(rest) = strip_prefix_case_insensitive(expression, "[type]") {
             if !rest.trim_start().starts_with("::") {
-                let type_name = self.eval_expression(rest, host, depth)?.as_string();
+                let type_name = self.eval_expression(parser, rest, host, depth)?.as_string();
                 return Ok(Value::Object(format!("Type:{type_name}")));
             }
         }
@@ -228,7 +238,7 @@ impl PowerShellEmulator {
             )));
         }
         if let Some(rest) = strip_prefix_case_insensitive(expression, "-join") {
-            let value = self.eval_expression(rest, host, depth)?;
+            let value = self.eval_expression(parser, rest, host, depth)?;
             return Ok(Value::String(match value {
                 Value::Array(values) => values.iter().map(Value::as_string).collect(),
                 other => other.as_string(),
@@ -298,32 +308,35 @@ impl PowerShellEmulator {
             &["*", "/", "%"][..],
             &[".."][..],
         ] {
-            if let Some((left, operator, right)) = find_top_level_binary(expression, operators) {
-                let left_value = self.eval_expression(left, host, depth)?;
-                let right_value = self.eval_expression(right, host, depth)?;
+            if let Some((left, operator, right)) =
+                find_top_level_binary(parser, expression, operators)
+            {
+                let left_value = self.eval_expression(parser, left, host, depth)?;
+                let right_value = self.eval_expression(parser, right, host, depth)?;
                 return Ok(self.apply_binary(left_value, operator, right_value, host, depth));
             }
         }
         for unary in ["-not", "!", "-bnot", "-", "+"] {
             if let Some(rest) = strip_prefix_case_insensitive(expression, unary) {
                 if !rest.trim().is_empty() {
-                    let value = self.eval_expression(rest, host, depth)?;
+                    let value = self.eval_expression(parser, rest, host, depth)?;
                     return Ok(Self::apply_unary(unary, value));
                 }
             }
         }
-        if let Some((base, index)) = split_index_expression(expression) {
-            let base = self.eval_expression(base, host, depth)?;
-            let index = self.eval_expression(index, host, depth)?;
+        if let Some((base, index)) = split_index_expression(parser, expression) {
+            let base = self.eval_expression(parser, base, host, depth)?;
+            let index = self.eval_expression(parser, index, host, depth)?;
             return Ok(index_value(base, index));
         }
-        if let Some((type_name, method, arguments)) = parse_static_call(expression) {
-            let method = if is_variable(&method) {
-                self.eval_expression(&method, host, depth)?.as_string()
+        if let Some((type_name, method, arguments)) = parse_static_call(parser, expression) {
+            let method = if is_variable(parser, &method) {
+                self.eval_expression(parser, &method, host, depth)?
+                    .as_string()
             } else {
                 method
             };
-            return self.eval_static_call(&type_name, &method, &arguments, host, depth);
+            return self.eval_static_call(parser, &type_name, &method, &arguments, host, depth);
         }
         if let Some((type_name, member)) = parse_static_member_access(expression) {
             let key = format!("__static:{}", type_name.to_ascii_lowercase());
@@ -343,54 +356,62 @@ impl PowerShellEmulator {
                 &self.current_location,
             ));
         }
-        if let Some((receiver, method, arguments)) = parse_instance_call(expression) {
-            let method = if is_variable(&method) {
-                self.eval_expression(&method, host, depth)?.as_string()
+        if let Some((receiver, method, arguments)) = parse_instance_call(parser, expression) {
+            let method = if is_variable(parser, &method) {
+                self.eval_expression(parser, &method, host, depth)?
+                    .as_string()
             } else {
                 method
             };
-            return self.eval_instance_call(receiver, &method, &arguments, host, depth);
+            return self.eval_instance_call(parser, receiver, &method, &arguments, host, depth);
         }
-        if let Some((receiver, member)) = parse_member_access(expression) {
-            let receiver = self.eval_expression(receiver, host, depth)?;
+        if let Some((receiver, member)) = parse_member_access(parser, expression) {
+            let receiver = self.eval_expression(parser, receiver, host, depth)?;
             return Ok(Self::read_member(receiver, member));
         }
         if starts_word(expression, "new-object") {
-            return self.eval_new_object(expression, host, depth);
+            return self.eval_new_object(parser, expression, host, depth);
         }
-        let comma_values = split_top_level(expression, ',');
+        let comma_values = split_top_level(parser, expression, ',');
         if comma_values.len() > 1 {
-            return self.eval_array(expression, host, depth);
+            return self.eval_array(parser, expression, host, depth);
         }
 
-        Ok(Value::String(self.interpolate(expression, host, depth)?))
+        Ok(Value::String(
+            self.interpolate(parser, expression, host, depth)?,
+        ))
     }
 
     pub(crate) fn eval_statement_or_expression(
         &mut self,
+        parser: &ParsedSource,
         input: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
-        if split_top_level(input, '|').len() > 1 || self.looks_like_command_expression(input) {
+        if split_top_level(parser, input, '|').len() > 1
+            || self.looks_like_command_expression(parser, input)
+        {
             return Ok(self
-                .execute_statement(input, host, depth)?
+                .execute_statement(parser, input, host, depth)?
                 .unwrap_or(Value::Null));
         }
-        self.eval_expression(input, host, depth)
+        self.eval_expression(parser, input, host, depth)
     }
 
     pub(crate) fn eval_new_object(
         &mut self,
+        parser: &ParsedSource,
         expression: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
-        let words = split_powershell_words(expression);
+        let words = split_powershell_words(parser, expression);
         let arguments = words.get(1..).unwrap_or_default();
         if let Some(prog_id) = named_or_positional(arguments, &["-comobject"], usize::MAX) {
             let prog_id = if prog_id.starts_with(['$', '\'', '"', '(']) {
-                self.eval_expression(&prog_id, host, depth)?.as_string()
+                self.eval_expression(parser, &prog_id, host, depth)?
+                    .as_string()
             } else {
                 prog_id.trim_matches(['\'', '"']).into()
             };
@@ -406,7 +427,7 @@ impl PowerShellEmulator {
         match normalized.as_str() {
             "io.memorystream" => {
                 let data = if let Some(argument) = argument {
-                    self.eval_expression(argument.trim_start_matches(','), host, depth)?
+                    self.eval_expression(parser, argument.trim_start_matches(','), host, depth)?
                         .as_bytes()
                 } else {
                     Vec::new()
@@ -415,7 +436,7 @@ impl PowerShellEmulator {
             }
             "io.streamreader" => {
                 let data = if let Some(argument) = argument {
-                    self.eval_expression(&argument, host, depth)?
+                    self.eval_expression(parser, &argument, host, depth)?
                 } else {
                     Value::Null
                 };
@@ -426,7 +447,7 @@ impl PowerShellEmulator {
             | "io.compression.zlibstream" => {
                 let data = argument
                     .as_deref()
-                    .map(|argument| self.eval_expression(argument, host, depth))
+                    .map(|argument| self.eval_expression(parser, argument, host, depth))
                     .transpose()?
                     .unwrap_or(Value::Null);
                 let bytes = match data {
@@ -448,40 +469,46 @@ impl PowerShellEmulator {
 
     pub(crate) fn eval_array(
         &mut self,
+        parser: &ParsedSource,
         expression: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
-        split_top_level(expression, ',')
+        split_top_level(parser, expression, ',')
             .into_iter()
             .filter(|item| !item.trim().is_empty())
-            .map(|item| self.eval_expression(item.trim(), host, depth))
+            .map(|item| self.eval_expression(parser, item.trim(), host, depth))
             .collect::<Result<Vec<_>, _>>()
             .map(Value::Array)
     }
 
     pub(crate) fn eval_hashtable(
         &mut self,
+        parser: &ParsedSource,
         expression: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
         let mut values = std::collections::BTreeMap::new();
-        for statement in split_statements(expression) {
-            for entry in split_top_level(statement, ',') {
-                let Some((key, value)) = split_key_value(entry) else {
+        for statement in split_statements(parser, expression) {
+            for entry in split_top_level(parser, statement, ',') {
+                let Some((key, value)) = split_key_value(parser, entry) else {
                     continue;
                 };
                 let key = key.trim().trim_matches(['\'', '"']).to_string();
-                values.insert(key, self.eval_expression(value, host, depth)?);
+                values.insert(key, self.eval_expression(parser, value, host, depth)?);
             }
         }
         Ok(Value::Map(values))
     }
 
     #[allow(clippy::too_many_lines)]
-    pub(crate) fn looks_like_command_expression(&self, expression: &str) -> bool {
-        let words = split_powershell_words(expression);
+    pub(crate) fn looks_like_command_expression(
+        &self,
+        parser: &ParsedSource,
+        expression: &str,
+    ) -> bool {
+        let words = split_powershell_words(parser, expression);
         let Some(command) = words.first() else {
             return false;
         };
@@ -597,12 +624,13 @@ impl PowerShellEmulator {
         )
     }
 
-    pub(crate) fn looks_like_value_expression(expression: &str) -> bool {
-        let words = split_powershell_words(expression);
+    pub(crate) fn looks_like_value_expression(parser: &ParsedSource, expression: &str) -> bool {
+        let words = split_powershell_words(parser, expression);
         if words.len() > 1 {
-            let first = tokenize(expression)
-                .tokens
+            let first = parser
+                .window(expression)
                 .into_iter()
+                .flat_map(|window| window.tokens().iter().copied())
                 .find(|token| !token.kind.is_trivia() && token.kind != TokenKind::NewLine);
             if first.is_some_and(|token| {
                 matches!(token.kind, TokenKind::Identifier | TokenKind::Keyword)
@@ -610,10 +638,10 @@ impl PowerShellEmulator {
                 return false;
             }
         }
-        if is_quoted(expression)
-            || is_variable(expression)
+        if is_quoted(parser, expression)
+            || is_variable(parser, expression)
             || parse_number(expression).is_some()
-            || split_top_level(expression, ',').len() > 1
+            || split_top_level(parser, expression, ',').len() > 1
             || matches!(expression.chars().next(), Some('[' | '@' | '!' | '+' | '-'))
         {
             return true;
@@ -649,12 +677,13 @@ impl PowerShellEmulator {
             "..",
         ]
         .iter()
-        .any(|operator| find_top_level_binary(expression, &[*operator]).is_some())
+        .any(|operator| find_top_level_binary(parser, expression, &[*operator]).is_some())
     }
 
     #[allow(clippy::too_many_lines)]
     pub(crate) fn eval_static_call(
         &mut self,
+        parser: &ParsedSource,
         type_name: &str,
         method: &str,
         arguments: &str,
@@ -666,7 +695,7 @@ impl PowerShellEmulator {
             .replace("System.", "")
             .to_ascii_lowercase();
         let normalized_method = method.to_ascii_lowercase();
-        let args = self.eval_call_arguments(arguments, host, depth)?;
+        let args = self.eval_call_arguments(parser, arguments, host, depth)?;
         if let dotnet::DotNetDispatch::Handled(value) =
             Self::eval_extended_static_call(type_name, method, &args, host, depth)?
         {
@@ -774,14 +803,15 @@ impl PowerShellEmulator {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn eval_instance_call(
         &mut self,
+        parser: &ParsedSource,
         receiver_expression: &str,
         method: &str,
         arguments: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
-        let receiver = self.eval_expression(receiver_expression, host, depth)?;
-        let args = self.eval_call_arguments(arguments, host, depth)?;
+        let receiver = self.eval_expression(parser, receiver_expression, host, depth)?;
+        let args = self.eval_call_arguments(parser, arguments, host, depth)?;
         if let com::ComDispatch::Handled(value) =
             self.eval_com_instance_call(receiver_expression, &receiver, method, &args, host, depth)?
         {
@@ -916,14 +946,15 @@ impl PowerShellEmulator {
 
     pub(crate) fn eval_call_arguments(
         &mut self,
+        parser: &ParsedSource,
         arguments: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Vec<Value>, PowerShellError> {
-        split_top_level(arguments, ',')
+        split_top_level(parser, arguments, ',')
             .into_iter()
             .filter(|argument| !argument.trim().is_empty())
-            .map(|argument| self.eval_expression(argument.trim(), host, depth))
+            .map(|argument| self.eval_expression(parser, argument.trim(), host, depth))
             .collect()
     }
 }

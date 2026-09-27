@@ -1,4 +1,5 @@
-use crate::tokenizer::{tokenize, CommentKind, Delimiter, Token, TokenKind};
+use crate::parser::ParsedSource;
+use crate::tokenizer::{CommentKind, Delimiter, Token, TokenKind};
 use std::borrow::Cow;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,20 +23,25 @@ pub(crate) struct Redirection {
     pub(crate) target: RedirectTarget,
 }
 
-pub(crate) fn parse_redirections(input: &str) -> Option<(&str, Vec<Redirection>)> {
-    let tokens = tokenize(input).tokens;
+pub(crate) fn parse_redirections<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+) -> Option<(&'a str, Vec<Redirection>)> {
+    let window = parser.window(input)?;
     let mut nesting = TokenNesting::default();
     let mut operators = Vec::new();
-    for token in tokens {
+    for token in window.tokens().iter().copied() {
         if nesting.is_top_level() && token.kind == TokenKind::Operator {
-            if let Some(redirection) = parse_redirection_operator(token.text(input)) {
+            if let Some(redirection) = parse_redirection_operator(token.text(window.source())) {
                 operators.push((token.span, redirection));
             }
         }
         nesting.observe(token.kind);
     }
     let first = operators.first()?.0.start;
-    let command = input[..first].trim();
+    let command = parser
+        .text(crate::tokenizer::Span::new(window.span().start, first))
+        .trim();
     if command.is_empty() {
         return None;
     }
@@ -45,9 +51,11 @@ pub(crate) fn parse_redirections(input: &str) -> Option<(&str, Vec<Redirection>)
         if matches!(redirection.target, RedirectTarget::File(ref path) if path.is_empty()) {
             let end = operators
                 .get(index + 1)
-                .map_or(input.len(), |(next, _)| next.start);
-            let target = input[span.end..end].trim();
-            let target = split_powershell_words(target)
+                .map_or(window.span().end, |(next, _)| next.start);
+            let target = parser
+                .text(crate::tokenizer::Span::new(span.end, end))
+                .trim();
+            let target = split_powershell_words(parser, target)
                 .first()
                 .cloned()
                 .unwrap_or_default();
@@ -97,25 +105,43 @@ fn parse_redirection_operator(operator: &str) -> Option<Redirection> {
     })
 }
 
-pub(crate) fn split_assignment(statement: &str) -> Option<(&str, &str)> {
-    let tokenization = tokenize(statement);
+pub(crate) fn split_assignment<'a>(
+    parser: &'a ParsedSource,
+    statement: &str,
+) -> Option<(&'a str, &'a str)> {
+    let window = parser.window(statement)?;
     let mut nesting = TokenNesting::default();
-    for token in tokenization.tokens {
+    for token in window.tokens().iter().copied() {
         if nesting.is_top_level()
             && token.kind == TokenKind::Operator
-            && token.text(statement) == "="
+            && token.text(window.source()) == "="
         {
-            let left = statement[..token.span.start].trim();
-            let significant = tokenize(left)
-                .tokens
-                .into_iter()
+            let left = parser
+                .text(crate::tokenizer::Span::new(
+                    window.span().start,
+                    token.span.start,
+                ))
+                .trim();
+            let significant = parser
+                .window(left)?
+                .tokens()
+                .iter()
+                .copied()
                 .filter(|candidate| !candidate.kind.is_trivia())
                 .collect::<Vec<_>>();
             if significant.first().is_some_and(|candidate| {
                 candidate.kind == TokenKind::Variable
                     || candidate.kind == TokenKind::Delimiter(Delimiter::LeftBracket)
             }) {
-                return Some((left, statement[token.span.end..].trim()));
+                return Some((
+                    left,
+                    parser
+                        .text(crate::tokenizer::Span::new(
+                            token.span.end,
+                            window.span().end,
+                        ))
+                        .trim(),
+                ));
             }
         }
         nesting.observe(token.kind);
@@ -123,16 +149,30 @@ pub(crate) fn split_assignment(statement: &str) -> Option<(&str, &str)> {
     None
 }
 
-pub(crate) fn split_compound_assignment(input: &str) -> Option<(&str, &str, &str)> {
+pub(crate) fn split_compound_assignment<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+) -> Option<(&'a str, &'a str, &'a str)> {
+    let window = parser.window(input)?;
     let mut nesting = TokenNesting::default();
-    for token in tokenize(input).tokens {
-        let operator = token.text(input);
+    for token in window.tokens().iter().copied() {
+        let operator = token.text(window.source());
         if nesting.is_top_level()
             && token.kind == TokenKind::Operator
             && matches!(operator, "+=" | "-=" | "*=" | "/=" | "%=")
         {
-            let left = input[..token.span.start].trim();
-            let right = input[token.span.end..].trim();
+            let left = parser
+                .text(crate::tokenizer::Span::new(
+                    window.span().start,
+                    token.span.start,
+                ))
+                .trim();
+            let right = parser
+                .text(crate::tokenizer::Span::new(
+                    token.span.end,
+                    window.span().end,
+                ))
+                .trim();
             if left.starts_with('$') {
                 return Some((left, &operator[..1], right));
             }
@@ -142,18 +182,18 @@ pub(crate) fn split_compound_assignment(input: &str) -> Option<(&str, &str, &str
     None
 }
 
-pub(crate) fn split_increment(input: &str) -> Option<(&str, i64)> {
+pub(crate) fn split_increment<'a>(parser: &ParsedSource, input: &'a str) -> Option<(&'a str, i64)> {
     let input = input.trim();
     for (operator, delta) in [("++", 1), ("--", -1)] {
         if let Some(variable) = input.strip_suffix(operator) {
             let variable = variable.trim();
-            if is_variable(variable) {
+            if is_variable(parser, variable) {
                 return Some((variable, delta));
             }
         }
         if let Some(variable) = input.strip_prefix(operator) {
             let variable = variable.trim();
-            if is_variable(variable) {
+            if is_variable(parser, variable) {
                 return Some((variable, delta));
             }
         }
@@ -161,12 +201,29 @@ pub(crate) fn split_increment(input: &str) -> Option<(&str, i64)> {
     None
 }
 
-pub(crate) fn split_key_value(input: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_key_value<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+) -> Option<(&'a str, &'a str)> {
+    let window = parser.window(input)?;
     let mut nesting = TokenNesting::default();
-    for token in tokenize(input).tokens {
-        if nesting.is_top_level() && token.kind == TokenKind::Operator && token.text(input) == "=" {
-            let key = input[..token.span.start].trim();
-            let value = input[token.span.end..].trim();
+    for token in window.tokens().iter().copied() {
+        if nesting.is_top_level()
+            && token.kind == TokenKind::Operator
+            && token.text(window.source()) == "="
+        {
+            let key = parser
+                .text(crate::tokenizer::Span::new(
+                    window.span().start,
+                    token.span.start,
+                ))
+                .trim();
+            let value = parser
+                .text(crate::tokenizer::Span::new(
+                    token.span.end,
+                    window.span().end,
+                ))
+                .trim();
             return (!key.is_empty()).then_some((key, value));
         }
         nesting.observe(token.kind);
@@ -175,6 +232,7 @@ pub(crate) fn split_key_value(input: &str) -> Option<(&str, &str)> {
 }
 
 pub(crate) fn parse_named_block<'a>(
+    parser: &'a ParsedSource,
     statement: &'a str,
     keyword: &str,
 ) -> Option<(&'a str, &'a str)> {
@@ -182,23 +240,41 @@ pub(crate) fn parse_named_block<'a>(
         return None;
     }
     let remainder = statement[keyword.len()..].trim_start();
-    let brace = tokenize(remainder)
-        .tokens
-        .into_iter()
+    let brace = parser
+        .window(remainder)?
+        .tokens()
+        .iter()
+        .copied()
         .find(|token| token.kind == TokenKind::Delimiter(Delimiter::LeftBrace))?
         .span
         .start;
-    let name = remainder[..brace].trim();
-    let (body, _) = extract_delimited(&remainder[brace..], '{', '}')?;
+    let remainder_window = parser.window(remainder)?;
+    let name = parser
+        .text(crate::tokenizer::Span::new(
+            remainder_window.span().start,
+            brace,
+        ))
+        .trim();
+    let block = parser.text(crate::tokenizer::Span::new(
+        brace,
+        remainder_window.span().end,
+    ));
+    let (body, _) = extract_delimited(parser, block, '{', '}')?;
     Some((name, body))
 }
 
-pub(crate) fn split_labeled_blocks(input: &str) -> Vec<(&str, &str)> {
+pub(crate) fn split_labeled_blocks<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+) -> Vec<(&'a str, &'a str)> {
     let mut blocks = Vec::new();
     let mut remainder = input;
     loop {
         let mut nesting = TokenNesting::default();
-        let brace = tokenize(remainder).tokens.into_iter().find(|token| {
+        let Some(window) = parser.window(remainder) else {
+            break;
+        };
+        let brace = window.tokens().iter().copied().find(|token| {
             let top_level = nesting.is_top_level();
             let matched = top_level && token.kind == TokenKind::Delimiter(Delimiter::LeftBrace);
             nesting.observe(token.kind);
@@ -207,9 +283,17 @@ pub(crate) fn split_labeled_blocks(input: &str) -> Vec<(&str, &str)> {
         let Some(brace) = brace else {
             break;
         };
-        let label = remainder[..brace.span.start].trim();
-        let Some((body, after_body)) = extract_delimited(&remainder[brace.span.start..], '{', '}')
-        else {
+        let label = parser
+            .text(crate::tokenizer::Span::new(
+                window.span().start,
+                brace.span.start,
+            ))
+            .trim();
+        let block = parser.text(crate::tokenizer::Span::new(
+            brace.span.start,
+            window.span().end,
+        ));
+        let Some((body, after_body)) = extract_delimited(parser, block, '{', '}') else {
             break;
         };
         blocks.push((label, body));
@@ -218,44 +302,47 @@ pub(crate) fn split_labeled_blocks(input: &str) -> Vec<(&str, &str)> {
     blocks
 }
 
-pub(crate) fn strip_comments(input: &str) -> Cow<'_, str> {
-    let tokenization = tokenize(input);
-    if !tokenization
-        .tokens
-        .iter()
-        .any(|token| token.kind.is_comment())
-    {
+pub(crate) fn strip_comments<'a>(parser: &'a ParsedSource, input: &'a str) -> Cow<'a, str> {
+    let Some(window) = parser.window(input) else {
+        return Cow::Borrowed(input);
+    };
+    if !window.tokens().iter().any(|token| token.kind.is_comment()) {
         return Cow::Borrowed(input);
     }
 
     let mut output = String::with_capacity(input.len());
     let mut cursor = 0;
-    for token in tokenization.tokens {
+    for token in window.tokens().iter().copied() {
         if token.kind.is_comment() {
-            output.push_str(&input[cursor..token.span.start]);
+            let start = token.span.start.saturating_sub(window.span().start);
+            let end = token.span.end.saturating_sub(window.span().start);
+            output.push_str(&input[cursor..start]);
             if matches!(token.kind, TokenKind::Comment(CommentKind::Block))
                 && output
                     .chars()
                     .next_back()
                     .is_some_and(|character| !character.is_whitespace())
-                && input[token.span.end..]
+                && input[end..]
                     .chars()
                     .next()
                     .is_some_and(|character| !character.is_whitespace())
             {
                 output.push(' ');
             }
-            cursor = token.span.end;
+            cursor = end;
         }
     }
     output.push_str(&input[cursor..]);
     Cow::Owned(output)
 }
 
-pub(crate) fn split_statements(script: &str) -> Vec<&str> {
-    let tokens = tokenize(script).tokens;
+pub(crate) fn split_statements<'a>(parser: &'a ParsedSource, script: &str) -> Vec<&'a str> {
+    let Some(window) = parser.window(script) else {
+        return Vec::new();
+    };
+    let tokens = window.tokens();
     let mut parts = Vec::new();
-    let mut start = 0;
+    let mut start = window.span().start;
     let mut nesting = TokenNesting::default();
     let mut previous_significant = None;
     for (index, token) in tokens.iter().copied().enumerate() {
@@ -272,12 +359,13 @@ pub(crate) fn split_statements(script: &str) -> Vec<&str> {
                 })
                 .copied();
             let continued_by_clause = next.is_some_and(|next| {
-                let text = next.text(script);
+                let text = next.text(window.source());
                 matches!(
                     text.to_ascii_lowercase().as_str(),
                     "else" | "elseif" | "catch" | "finally" | "until"
                 ) || (text.eq_ignore_ascii_case("while")
-                    && script[start..token.span.start]
+                    && parser
+                        .text(crate::tokenizer::Span::new(start, token.span.start))
                         .trim_start()
                         .to_ascii_lowercase()
                         .starts_with("do"))
@@ -287,7 +375,7 @@ pub(crate) fn split_statements(script: &str) -> Vec<&str> {
             false
         };
         if split {
-            parts.push(&script[start..token.span.start]);
+            parts.push(parser.text(crate::tokenizer::Span::new(start, token.span.start)));
             start = token.span.end;
             previous_significant = None;
             continue;
@@ -297,36 +385,50 @@ pub(crate) fn split_statements(script: &str) -> Vec<&str> {
         }
         nesting.observe(token.kind);
     }
-    parts.push(&script[start..]);
+    parts.push(parser.text(crate::tokenizer::Span::new(start, window.span().end)));
     parts
 }
 
-pub(crate) fn split_top_level(input: &str, separator: char) -> Vec<&str> {
-    split_top_level_many(input, &[separator])
+pub(crate) fn split_top_level<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+    separator: char,
+) -> Vec<&'a str> {
+    split_top_level_many(parser, input, &[separator])
 }
 
-fn split_top_level_many<'a>(input: &'a str, separators: &[char]) -> Vec<&'a str> {
+fn split_top_level_many<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+    separators: &[char],
+) -> Vec<&'a str> {
+    let Some(window) = parser.window(input) else {
+        return Vec::new();
+    };
     let mut parts = Vec::new();
-    let mut start = 0;
+    let mut start = window.span().start;
     let mut nesting = TokenNesting::default();
-    for token in tokenize(input).tokens {
-        if nesting.is_top_level() && token_matches_separator(token, input, separators) {
-            parts.push(&input[start..token.span.start]);
+    for token in window.tokens().iter().copied() {
+        if nesting.is_top_level() && token_matches_separator(token, window.source(), separators) {
+            parts.push(parser.text(crate::tokenizer::Span::new(start, token.span.start)));
             start = token.span.end;
             continue;
         }
         nesting.observe(token.kind);
     }
-    parts.push(&input[start..]);
+    parts.push(parser.text(crate::tokenizer::Span::new(start, window.span().end)));
     parts
 }
 
-pub(crate) fn split_powershell_words(input: &str) -> Vec<String> {
+pub(crate) fn split_powershell_words(parser: &ParsedSource, input: &str) -> Vec<String> {
+    let Some(window) = parser.window(input) else {
+        return Vec::new();
+    };
     let mut words = Vec::new();
     let mut start = None;
-    let mut end = 0;
+    let mut end = window.span().start;
     let mut nesting = TokenNesting::default();
-    for token in tokenize(input).tokens {
+    for token in window.tokens().iter().copied() {
         let top_level_separator = nesting.is_top_level()
             && matches!(
                 token.kind,
@@ -336,7 +438,9 @@ pub(crate) fn split_powershell_words(input: &str) -> Vec<String> {
             );
         if top_level_separator {
             if let Some(word_start) = start.take() {
-                words.push(clean_line_continuations(&input[word_start..end]));
+                words.push(clean_line_continuations(
+                    parser.text(crate::tokenizer::Span::new(word_start, end)),
+                ));
             }
             if token.kind == TokenKind::Comment(CommentKind::Line) {
                 break;
@@ -352,7 +456,9 @@ pub(crate) fn split_powershell_words(input: &str) -> Vec<String> {
         nesting.observe(token.kind);
     }
     if let Some(word_start) = start {
-        words.push(clean_line_continuations(&input[word_start..end]));
+        words.push(clean_line_continuations(
+            parser.text(crate::tokenizer::Span::new(word_start, end)),
+        ));
     }
     words
 }
@@ -388,19 +494,26 @@ impl TokenNesting {
     }
 }
 
-pub(crate) fn extract_delimited(input: &str, open: char, close: char) -> Option<(&str, &str)> {
+pub(crate) fn extract_delimited<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+    open: char,
+    close: char,
+) -> Option<(&'a str, &'a str)> {
     let input = input.trim_start();
+    let window = parser.window(input)?;
     let open_kind = delimiter_kind(open)?;
     let close_kind = delimiter_kind(close)?;
-    let tokens = tokenize(input).tokens;
-    let first = tokens
+    let first = window
+        .tokens()
         .iter()
         .find(|token| !token.kind.is_trivia() && token.kind != TokenKind::NewLine)?;
     if first.kind != open_kind {
         return None;
     }
     let mut depth = 0_usize;
-    for token in tokens
+    for token in window
+        .tokens()
         .iter()
         .skip_while(|token| token.span.start < first.span.start)
     {
@@ -410,8 +523,14 @@ pub(crate) fn extract_delimited(input: &str, open: char, close: char) -> Option<
             depth = depth.saturating_sub(1);
             if depth == 0 {
                 return Some((
-                    &input[first.span.end..token.span.start],
-                    &input[token.span.end..],
+                    parser.text(crate::tokenizer::Span::new(
+                        first.span.end,
+                        token.span.start,
+                    )),
+                    parser.text(crate::tokenizer::Span::new(
+                        token.span.end,
+                        window.span().end,
+                    )),
                 ));
             }
         }
@@ -419,8 +538,13 @@ pub(crate) fn extract_delimited(input: &str, open: char, close: char) -> Option<
     None
 }
 
-pub(crate) fn strip_balanced_outer(input: &str, open: char, close: char) -> Option<&str> {
-    let (inner, remainder) = extract_delimited(input, open, close)?;
+pub(crate) fn strip_balanced_outer<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+    open: char,
+    close: char,
+) -> Option<&'a str> {
+    let (inner, remainder) = extract_delimited(parser, input, open, close)?;
     remainder.trim().is_empty().then_some(inner)
 }
 
@@ -463,22 +587,30 @@ pub(crate) fn normalize_variable(input: &str) -> String {
         .trim_start_matches('$')
         .trim_start_matches('{')
         .trim_end_matches('}')
-        .to_ascii_lowercase()
+        .to_lowercase()
 }
 
-pub(crate) fn is_variable(input: &str) -> bool {
-    let tokens = tokenize(input)
-        .tokens
-        .into_iter()
+pub(crate) fn is_variable(parser: &ParsedSource, input: &str) -> bool {
+    let Some(window) = parser.window(input) else {
+        return false;
+    };
+    let tokens = window
+        .tokens()
+        .iter()
+        .copied()
         .filter(|token| !token.kind.is_trivia() && token.kind != TokenKind::NewLine)
         .collect::<Vec<_>>();
     tokens.len() == 1 && tokens[0].kind == TokenKind::Variable
 }
 
-pub(crate) fn is_quoted(input: &str) -> bool {
-    let tokens = tokenize(input)
-        .tokens
-        .into_iter()
+pub(crate) fn is_quoted(parser: &ParsedSource, input: &str) -> bool {
+    let Some(window) = parser.window(input) else {
+        return false;
+    };
+    let tokens = window
+        .tokens()
+        .iter()
+        .copied()
         .filter(|token| !token.kind.is_trivia() && token.kind != TokenKind::NewLine)
         .collect::<Vec<_>>();
     tokens.len() == 1 && matches!(tokens[0].kind, TokenKind::String(_))
@@ -542,6 +674,16 @@ pub(crate) fn starts_word(input: &str, word: &str) -> bool {
 }
 
 pub(crate) fn strip_prefix_case_insensitive<'a>(input: &'a str, prefix: &str) -> Option<&'a str> {
+    if let Some(prefix_remainder) = prefix.strip_prefix('-') {
+        let first = input.chars().next()?;
+        if is_powershell_dash(first) {
+            let input_remainder = &input[first.len_utf8()..];
+            return input_remainder
+                .get(..prefix_remainder.len())
+                .filter(|value| value.eq_ignore_ascii_case(prefix_remainder))
+                .map(|_| &input_remainder[prefix_remainder.len()..]);
+        }
+    }
     input
         .get(..prefix.len())
         .filter(|value| value.eq_ignore_ascii_case(prefix))
@@ -555,19 +697,22 @@ pub(crate) fn find_word_case_insensitive(input: &str, needle: &str) -> Option<us
 }
 
 pub(crate) fn find_top_level_binary<'a, 'b>(
-    input: &'a str,
+    parser: &'a ParsedSource,
+    input: &str,
     operators: &'b [&'b str],
 ) -> Option<(&'a str, &'b str, &'a str)> {
+    let window = parser.window(input)?;
     let mut nesting = TokenNesting::default();
     let mut matches = Vec::new();
     let mut previous_significant = None;
-    for token in tokenize(input).tokens {
+    for token in window.tokens().iter().copied() {
         if nesting.is_top_level() && token.kind == TokenKind::Operator {
-            let text = token.text(input);
+            let text = token.text(window.source());
+            let normalized = normalize_operator(text);
             if let Some(operator) = operators
                 .iter()
                 .copied()
-                .find(|operator| text.eq_ignore_ascii_case(operator))
+                .find(|operator| normalized.eq_ignore_ascii_case(operator))
             {
                 let unary_sign = matches!(operator, "+" | "-")
                     && previous_significant.is_none_or(|previous: Token| {
@@ -594,20 +739,31 @@ pub(crate) fn find_top_level_binary<'a, 'b>(
         nesting.observe(token.kind);
     }
     let (start, end, operator) = matches.last().copied()?;
-    let left = input[..start].trim();
-    let right = input[end..].trim();
+    let left = parser
+        .text(crate::tokenizer::Span::new(window.span().start, start))
+        .trim();
+    let right = parser
+        .text(crate::tokenizer::Span::new(end, window.span().end))
+        .trim();
     (!left.is_empty() && !right.is_empty()).then_some((left, operator, right))
 }
 
-pub(crate) fn split_index_expression(input: &str) -> Option<(&str, &str)> {
+pub(crate) fn split_index_expression<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+) -> Option<(&'a str, &'a str)> {
     let input = input.trim();
-    let significant = tokenize(input)
-        .tokens
-        .into_iter()
+    let window = parser.window(input)?;
+    let significant = window
+        .tokens()
+        .iter()
+        .copied()
         .filter(|token| !token.kind.is_trivia() && token.kind != TokenKind::NewLine)
         .collect::<Vec<_>>();
     let last = *significant.last()?;
-    if last.kind != TokenKind::Delimiter(Delimiter::RightBracket) || last.span.end != input.len() {
+    if last.kind != TokenKind::Delimiter(Delimiter::RightBracket)
+        || last.span.end != window.span().end
+    {
         return None;
     }
     let mut depth = 0_usize;
@@ -616,10 +772,17 @@ pub(crate) fn split_index_expression(input: &str) -> Option<(&str, &str)> {
             depth += 1;
         } else if token.kind == TokenKind::Delimiter(Delimiter::LeftBracket) {
             depth = depth.saturating_sub(1);
-            if depth == 0 && token.span.start > 0 {
+            if depth == 0 && token.span.start > window.span().start {
                 return Some((
-                    input[..token.span.start].trim(),
-                    input[token.span.end..last.span.start].trim(),
+                    parser
+                        .text(crate::tokenizer::Span::new(
+                            window.span().start,
+                            token.span.start,
+                        ))
+                        .trim(),
+                    parser
+                        .text(crate::tokenizer::Span::new(token.span.end, last.span.start))
+                        .trim(),
                 ));
             }
         }
@@ -627,11 +790,16 @@ pub(crate) fn split_index_expression(input: &str) -> Option<(&str, &str)> {
     None
 }
 
-pub(crate) fn parse_static_call(input: &str) -> Option<(String, String, String)> {
+pub(crate) fn parse_static_call(
+    parser: &ParsedSource,
+    input: &str,
+) -> Option<(String, String, String)> {
     let input = input.trim();
-    let significant = tokenize(input)
-        .tokens
-        .into_iter()
+    let window = parser.window(input)?;
+    let significant = window
+        .tokens()
+        .iter()
+        .copied()
         .filter(|token| !token.kind.is_trivia() && token.kind != TokenKind::NewLine)
         .collect::<Vec<_>>();
     let first = *significant.first()?;
@@ -657,19 +825,40 @@ pub(crate) fn parse_static_call(input: &str) -> Option<(String, String, String)>
     let close_index = close_index?;
     let close = significant[close_index];
     let static_operator = significant.get(close_index + 1)?;
-    if static_operator.kind != TokenKind::Operator || static_operator.text(input) != "::" {
+    if static_operator.kind != TokenKind::Operator || static_operator.text(window.source()) != "::"
+    {
         return None;
     }
-    let type_name = input[first.span.end..close.span.start].trim().to_string();
-    let call = input[static_operator.span.end..].trim_start();
-    let open = find_call_open(call)?;
+    let type_name = parser
+        .text(crate::tokenizer::Span::new(
+            first.span.end,
+            close.span.start,
+        ))
+        .trim()
+        .to_string();
+    let call = parser
+        .text(crate::tokenizer::Span::new(
+            static_operator.span.end,
+            window.span().end,
+        ))
+        .trim_start();
+    let open = find_call_open(parser, call)?;
     if !call.ends_with(')') {
         return None;
     }
+    let call_window = parser.window(call)?;
     Some((
         type_name,
-        call[..open].trim().to_string(),
-        call[open + 1..call.len() - 1].to_string(),
+        parser
+            .text(crate::tokenizer::Span::new(call_window.span().start, open))
+            .trim()
+            .to_string(),
+        parser
+            .text(crate::tokenizer::Span::new(
+                open + 1,
+                call_window.span().end - 1,
+            ))
+            .to_string(),
     ))
 }
 
@@ -689,24 +878,43 @@ pub(crate) fn parse_static_member_access(input: &str) -> Option<(String, String)
     .then(|| (type_name.into(), member.into()))
 }
 
-pub(crate) fn parse_instance_call(input: &str) -> Option<(&str, String, String)> {
+pub(crate) fn parse_instance_call<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+) -> Option<(&'a str, String, String)> {
     if !input.ends_with(')') {
         return None;
     }
-    let open = find_call_open(input)?;
-    let prefix = &input[..open];
-    let dot = find_last_top_level_dot(prefix)?;
+    let window = parser.window(input)?;
+    let open = find_call_open(parser, input)?;
+    let prefix = parser.text(crate::tokenizer::Span::new(window.span().start, open));
+    let dot = find_last_top_level_dot(parser, prefix)?;
     Some((
-        prefix[..dot].trim(),
-        prefix[dot + 1..].trim().to_string(),
-        input[open + 1..input.len() - 1].to_string(),
+        parser
+            .text(crate::tokenizer::Span::new(window.span().start, dot))
+            .trim(),
+        parser
+            .text(crate::tokenizer::Span::new(dot + 1, open))
+            .trim()
+            .to_string(),
+        parser
+            .text(crate::tokenizer::Span::new(open + 1, window.span().end - 1))
+            .to_string(),
     ))
 }
 
-pub(crate) fn parse_member_access(input: &str) -> Option<(&str, &str)> {
-    let dot = find_last_top_level_dot(input)?;
-    let receiver = input[..dot].trim();
-    let member = input[dot + 1..].trim();
+pub(crate) fn parse_member_access<'a>(
+    parser: &'a ParsedSource,
+    input: &str,
+) -> Option<(&'a str, &'a str)> {
+    let window = parser.window(input)?;
+    let dot = find_last_top_level_dot(parser, input)?;
+    let receiver = parser
+        .text(crate::tokenizer::Span::new(window.span().start, dot))
+        .trim();
+    let member = parser
+        .text(crate::tokenizer::Span::new(dot + 1, window.span().end))
+        .trim();
     (!receiver.is_empty()
         && !member.is_empty()
         && member
@@ -715,9 +923,10 @@ pub(crate) fn parse_member_access(input: &str) -> Option<(&str, &str)> {
     .then_some((receiver, member))
 }
 
-fn find_call_open(input: &str) -> Option<usize> {
+fn find_call_open(parser: &ParsedSource, input: &str) -> Option<usize> {
+    let window = parser.window(input)?;
     let mut nesting = TokenNesting::default();
-    for token in tokenize(input).tokens {
+    for token in window.tokens().iter().copied() {
         if nesting.is_top_level() && token.kind == TokenKind::Delimiter(Delimiter::LeftParenthesis)
         {
             return Some(token.span.start);
@@ -727,10 +936,11 @@ fn find_call_open(input: &str) -> Option<usize> {
     None
 }
 
-fn find_last_top_level_dot(input: &str) -> Option<usize> {
+fn find_last_top_level_dot(parser: &ParsedSource, input: &str) -> Option<usize> {
+    let window = parser.window(input)?;
     let mut nesting = TokenNesting::default();
     let mut result = None;
-    for token in tokenize(input).tokens {
+    for token in window.tokens().iter().copied() {
         if nesting.is_top_level() && token.kind == TokenKind::Delimiter(Delimiter::Dot) {
             result = Some(token.span.start);
         }
@@ -766,9 +976,10 @@ pub(crate) fn find_switch(arguments: &[String], name: &str) -> Option<usize> {
 }
 
 fn parameter_matches_any(argument: &str, names: &[&str]) -> bool {
+    let argument = normalize_parameter(argument);
     let argument = argument
         .split_once(':')
-        .map_or(argument, |(name, _)| name)
+        .map_or(argument.as_ref(), |(name, _)| name)
         .to_ascii_lowercase();
     if !argument.starts_with('-') || argument.len() < 2 {
         return false;
@@ -790,10 +1001,11 @@ fn positional_arguments(arguments: &[String]) -> Vec<String> {
     let mut index = 0;
     while index < arguments.len() {
         let argument = &arguments[index];
-        if argument.starts_with('-') {
-            let name = argument
+        if argument.chars().next().is_some_and(is_powershell_dash) {
+            let normalized = normalize_parameter(argument);
+            let name = normalized
                 .split_once(':')
-                .map_or(argument.as_str(), |(name, _)| name);
+                .map_or(normalized.as_ref(), |(name, _)| name);
             if common_parameter_takes_value(name) && !argument.contains(':') {
                 index += 2;
             } else {
@@ -805,6 +1017,24 @@ fn positional_arguments(arguments: &[String]) -> Vec<String> {
         }
     }
     positional
+}
+
+fn normalize_operator(input: &str) -> Cow<'_, str> {
+    let Some(first) = input.chars().next() else {
+        return Cow::Borrowed(input);
+    };
+    if !is_powershell_dash(first) || first == '-' {
+        return Cow::Borrowed(input);
+    }
+    Cow::Owned(format!("-{}", &input[first.len_utf8()..]))
+}
+
+fn normalize_parameter(input: &str) -> Cow<'_, str> {
+    normalize_operator(input)
+}
+
+const fn is_powershell_dash(character: char) -> bool {
+    matches!(character, '-' | '\u{2013}' | '\u{2014}' | '\u{2015}')
 }
 
 fn common_parameter_takes_value(name: &str) -> bool {

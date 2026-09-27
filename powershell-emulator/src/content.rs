@@ -1,3 +1,4 @@
+use crate::parser::ParsedSource;
 use crate::syntax::{find_switch, named_or_positional};
 use crate::transforms::{
     decode_ascii, decode_utf16_be, decode_utf16_le, decode_utf32_be, decode_utf32_le, decode_utf8,
@@ -24,6 +25,7 @@ enum TextEncoding {
 impl PowerShellEmulator {
     pub(crate) fn execute_content_command(
         &mut self,
+        parser: &ParsedSource,
         command: &str,
         arguments: &[String],
         host: &mut dyn Host,
@@ -38,10 +40,10 @@ impl PowerShellEmulator {
                         .unwrap_or_default();
                 let value_expression =
                     named_or_positional(arguments, &["-value", "-inputobject"], 1);
-                let path = self.eval_content_path(&path_expression, host, depth)?;
+                let path = self.eval_content_path(parser, &path_expression, host, depth)?;
                 let target = self.resolve_provider_path(&path);
                 let value = if let Some(expression) = value_expression {
-                    self.eval_expression(&expression, host, depth)?
+                    self.eval_expression(parser, &expression, host, depth)?
                 } else {
                     self.variables.get("input").cloned().unwrap_or(Value::Null)
                 };
@@ -69,7 +71,7 @@ impl PowerShellEmulator {
             "get-content" => {
                 let path_expression = named_or_positional(arguments, &["-path", "-literalpath"], 0)
                     .unwrap_or_default();
-                let path = self.eval_content_path(&path_expression, host, depth)?;
+                let path = self.eval_content_path(parser, &path_expression, host, depth)?;
                 let target = self.resolve_provider_path(&path);
                 let explicit_encoding = named_or_positional(arguments, &["-encoding"], usize::MAX);
                 let value = host
@@ -107,13 +109,14 @@ impl PowerShellEmulator {
 
     pub(crate) fn write_redirected_output(
         &mut self,
+        parser: &ParsedSource,
         path: &str,
         values: &[Value],
         append: bool,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<(), PowerShellError> {
-        let path = self.eval_content_path(path, host, depth)?;
+        let path = self.eval_content_path(parser, path, host, depth)?;
         let target = self.resolve_provider_path(&path);
         let text = if values.is_empty() {
             String::new()
@@ -133,12 +136,13 @@ impl PowerShellEmulator {
 
     fn eval_content_path(
         &mut self,
+        parser: &ParsedSource,
         path: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<String, PowerShellError> {
         if path.starts_with(['$', '\'', '"', '(']) {
-            self.eval_expression(path, host, depth)
+            self.eval_expression(parser, path, host, depth)
                 .map(|value| value.as_string())
         } else {
             Ok(path.into())

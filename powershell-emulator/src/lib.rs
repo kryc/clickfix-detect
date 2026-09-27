@@ -9,6 +9,7 @@ mod engine_control;
 mod engine_expression;
 mod engine_operators;
 mod engine_support;
+mod parser;
 mod pipeline;
 mod provider_paths;
 mod providers;
@@ -26,6 +27,7 @@ use emulator_core::{
     sha256_hex, ArtifactKind, Engine, EventKind, Host, HostError, NetworkIntent, NetworkRequest,
     ProcessIntent, TraceEvent,
 };
+use parser::ParsedSource;
 use regex::Regex;
 use runtime::{FlowControl, FunctionDefinition};
 use serde::{Deserialize, Serialize};
@@ -42,7 +44,7 @@ use syntax::{
     trim_url_punctuation, NumberLiteral,
 };
 use thiserror::Error;
-use tokenizer::{tokenize, StringKind, TokenKind};
+use tokenizer::{StringKind, TokenKind};
 use transforms::{
     bytes_to_value, decode_ascii, decode_base64, decode_candidate, decode_utf16_be,
     decode_utf16_le, decode_utf8, encode_utf16_le, hex_decode, percent_decode, unescape_powershell,
@@ -53,7 +55,7 @@ pub use value::Value;
 static URL_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r#"(?i)\bhttps?://[^\s"'<>`]+"#).expect("valid URL regex"));
 static VARIABLE_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\$(?:\{([^}]+)\}|((?:[a-z_][a-z0-9_]*:)?[a-z_?][a-z0-9_?]*))")
+    Regex::new(r"(?i)\$(?:\{([^}]+)\}|((?:[$?^]|(?:[\p{L}\p{Nd}_?]+:)?[\p{L}\p{Nd}_?]+)))")
         .expect("valid variable regex")
 });
 static XML_ELEMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
@@ -71,7 +73,7 @@ pub struct PowerShellResult {
 pub enum PowerShellError {
     #[error(transparent)]
     Host(#[from] HostError),
-    #[error("PowerShell parser initialization failed: {0}")]
+    #[error("PowerShell parsing failed: {0}")]
     Parser(String),
     #[error("PowerShell expression could not be evaluated: {0}")]
     Evaluation(String),
@@ -187,9 +189,9 @@ impl PowerShellEmulator {
     ///
     /// # Errors
     ///
-    /// Returns an error when parser initialization fails, an expression cannot
-    /// be evaluated, or the virtual host rejects an operation because a
-    /// resource limit was reached.
+    /// Returns an error when lexical validation fails, an expression cannot be
+    /// evaluated, or the virtual host rejects an operation because a resource
+    /// limit was reached.
     pub fn emulate(
         &mut self,
         script: &str,
@@ -199,71 +201,30 @@ impl PowerShellEmulator {
         self.flow = FlowControl::None;
         self.emitted_values.clear();
         host.consume_step(Engine::PowerShell, depth, "parsing PowerShell input")?;
-        let tokenization = tokenize(script);
+        let parsed = ParsedSource::parse(script)
+            .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
         host.emit(
             TraceEvent::new(
                 depth,
                 Engine::PowerShell,
                 EventKind::Parse,
-                Self::parse_message(),
+                "parsed PowerShell input with span tokenizer",
             )
             .with_data("bytes", script.len().to_string())
-            .with_data("tokens", tokenization.tokens.len().to_string()),
+            .with_data("tokens", parsed.token_count().to_string()),
         );
-        for diagnostic in tokenization.diagnostics {
+        for diagnostic in parsed.diagnostics() {
             host.unsupported(
                 Engine::PowerShell,
                 depth,
-                &format!("PowerShell tokenizer diagnostic: {diagnostic}"),
+                &format!("PowerShell structural diagnostic: {diagnostic}"),
             );
         }
-
-        #[cfg(not(target_arch = "wasm32"))]
-        Self::check_parse_tree(script, host, depth)?;
-
-        let last_value = self.execute_script(script, host, depth)?;
+        let last_value = self.execute_script(&parsed, parsed.source(), host, depth)?;
         Ok(PowerShellResult {
             stdout: self.stdout.clone(),
             last_value,
         })
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn parse_message() -> &'static str {
-        "parsed PowerShell input with tree-sitter"
-    }
-
-    #[cfg(target_arch = "wasm32")]
-    fn parse_message() -> &'static str {
-        "parsed PowerShell input with span tokenizer"
-    }
-
-    #[cfg(not(target_arch = "wasm32"))]
-    fn check_parse_tree(
-        script: &str,
-        host: &mut dyn Host,
-        depth: usize,
-    ) -> Result<(), PowerShellError> {
-        let mut parser = tree_sitter::Parser::new();
-        parser
-            .set_language(&tree_sitter_powershell::language())
-            .map_err(|error| PowerShellError::Parser(error.to_string()))?;
-        if let Some(tree) = parser.parse(script, None) {
-            if tree.root_node().has_error() {
-                host.unsupported(
-                    Engine::PowerShell,
-                    depth,
-                    "PowerShell parse tree contains syntax errors; continuing conservatively",
-                );
-            }
-        } else {
-            host.unsupported(
-                Engine::PowerShell,
-                depth,
-                "tree-sitter did not return a PowerShell parse tree",
-            );
-        }
-        Ok(())
     }
 }
 
@@ -587,10 +548,37 @@ mod tests {
     }
 
     #[test]
+    fn preserves_native_arguments_after_stop_parsing_token() {
+        let mut host = VirtualHost::new(AnalysisLimits::default());
+        let mut emulator = PowerShellEmulator::new();
+
+        emulator
+            .emulate("cmd.exe --% /c echo %PATH% & literal", &mut host, 0)
+            .unwrap();
+
+        let intents = host.take_process_intents();
+        assert_eq!(intents.len(), 1);
+        assert_eq!(intents[0].args, ["/c echo %PATH% & literal"]);
+    }
+
+    #[test]
+    fn removes_end_of_parameters_marker_and_preserves_dash_arguments() {
+        let mut host = VirtualHost::new(AnalysisLimits::default());
+        let mut emulator = PowerShellEmulator::new();
+
+        emulator
+            .emulate("Write-Output -- -InputObject", &mut host, 0)
+            .unwrap();
+
+        assert_eq!(emulator.drain_stdout(), ["-InputObject"]);
+    }
+
+    #[test]
     fn tokenizer_based_statement_splitting_keeps_here_strings_atomic() {
         let script =
             "$x = @\"\nline one; still data\nline two\n\"@\nWrite-Output $x\nWrite-Output 'a;b'";
-        let statements = split_statements(script)
+        let parser = ParsedSource::parse(script).expect("valid source");
+        let statements = split_statements(&parser, script)
             .into_iter()
             .filter(|statement| !statement.trim().is_empty())
             .collect::<Vec<_>>();
@@ -603,10 +591,109 @@ mod tests {
     #[test]
     fn tokenizer_based_comment_removal_preserves_hashes_in_strings() {
         let statement = r##"Write-Output "#safe" # trailing comment"##;
+        let parser = ParsedSource::parse(statement).expect("valid source");
 
         assert_eq!(
-            strip_comments(statement).trim(),
+            strip_comments(&parser, statement).trim(),
             r##"Write-Output "#safe""##
         );
+    }
+
+    #[test]
+    fn emulation_tokenizes_source_once() {
+        let mut host = VirtualHost::new(AnalysisLimits::default());
+        let mut emulator = PowerShellEmulator::new();
+        tokenizer::reset_tokenize_calls();
+
+        emulator
+            .emulate("$x = 1 + 2; Write-Output $x", &mut host, 0)
+            .unwrap();
+
+        assert_eq!(tokenizer::tokenize_calls(), 1);
+        assert_eq!(emulator.drain_stdout(), ["3"]);
+    }
+
+    #[test]
+    fn lexical_errors_stop_before_behavioral_emulation() {
+        for (script, expected) in [
+            (
+                "Invoke-WebRequest https://example.invalid/payload '",
+                "unterminated string literal",
+            ),
+            ("Invoke-Expression <# payload", "unterminated block comment"),
+            ("$payload = @\"\ncommand", "unterminated here-string"),
+            ("${payload", "unterminated braced variable"),
+        ] {
+            let mut host = VirtualHost::new(AnalysisLimits::default());
+            let mut emulator = PowerShellEmulator::new();
+
+            let error = emulator.emulate(script, &mut host, 0).unwrap_err();
+
+            assert!(error.to_string().contains(expected));
+            let snapshot = host.snapshot();
+            assert!(snapshot.trace.is_empty());
+            assert!(snapshot.virtual_files.is_empty());
+            assert!(host.take_process_intents().is_empty());
+        }
+    }
+
+    #[test]
+    fn evaluates_unicode_variable_names_case_insensitively() {
+        let mut host = VirtualHost::new(AnalysisLimits::default());
+        let mut emulator = PowerShellEmulator::new();
+
+        emulator
+            .emulate(
+                "$végösszeg = 'safe'; Write-Output \"$VÉGÖSSZEG\"",
+                &mut host,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(emulator.drain_stdout(), ["safe"]);
+    }
+
+    #[test]
+    fn evaluates_smart_quotes_and_unicode_dash_operators() {
+        let mut host = VirtualHost::new(AnalysisLimits::default());
+        let mut emulator = PowerShellEmulator::new();
+
+        emulator
+            .emulate(
+                "Write-Output –NoEnumerate “safe”\nWrite-Output (3 – 2)",
+                &mut host,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(emulator.drain_stdout(), ["safe", "1"]);
+    }
+
+    #[test]
+    fn evaluates_statements_inside_expandable_string_subexpressions() {
+        let mut host = VirtualHost::new(AnalysisLimits::default());
+        let mut emulator = PowerShellEmulator::new();
+
+        emulator
+            .emulate(
+                "Write-Output \"result: $(if ($true) { 'yes' } else { 'no' })\"",
+                &mut host,
+                0,
+            )
+            .unwrap();
+
+        assert_eq!(emulator.drain_stdout(), ["result: yes"]);
+    }
+
+    #[test]
+    fn evaluates_here_strings_with_trailing_pipeline_syntax() {
+        let mut host = VirtualHost::new(AnalysisLimits::default());
+        let mut emulator = PowerShellEmulator::new();
+
+        emulator
+            .emulate("Write-Output (@' \nsafe\n'@)", &mut host, 0)
+            .unwrap();
+
+        assert_eq!(emulator.drain_stdout(), ["safe"]);
     }
 }

@@ -5,6 +5,7 @@ use super::{
     wildcard_match, ArtifactKind, Engine, EventKind, FlowControl, FunctionDefinition, Host,
     NetworkIntent, NetworkRequest, PowerShellEmulator, PowerShellError, TraceEvent, Value, URL_RE,
 };
+use crate::parser::ParsedSource;
 use std::collections::BTreeMap;
 
 fn splat_variable_name(argument: &str) -> Option<String> {
@@ -15,7 +16,7 @@ fn splat_variable_name(argument: &str) -> Option<String> {
     Some(
         name.trim_start_matches('{')
             .trim_end_matches('}')
-            .to_ascii_lowercase(),
+            .to_lowercase(),
     )
 }
 
@@ -40,6 +41,30 @@ fn powershell_argument(value: &Value) -> String {
     }
 }
 
+fn apply_end_of_parameters(arguments: Vec<String>) -> Vec<String> {
+    let Some(marker) = arguments.iter().position(|argument| argument == "--") else {
+        return arguments;
+    };
+    arguments
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, argument)| {
+            if index == marker {
+                None
+            } else if index > marker
+                && argument
+                    .chars()
+                    .next()
+                    .is_some_and(|character| matches!(character, '-' | '–' | '—' | '―'))
+            {
+                Some(powershell_argument(&Value::String(argument)))
+            } else {
+                Some(argument)
+            }
+        })
+        .collect()
+}
+
 fn output_value(output: &[Value]) -> Option<Value> {
     match output {
         [] => None,
@@ -52,18 +77,19 @@ impl PowerShellEmulator {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn execute_command(
         &mut self,
+        parser: &ParsedSource,
         statement: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Option<Value>, PowerShellError> {
-        let words = split_powershell_words(statement);
+        let words = split_powershell_words(parser, statement);
         let Some(raw_command) = words.first() else {
             return Ok(None);
         };
         let command = self
-            .expand_command_name(raw_command, host, depth)?
+            .expand_command_name(parser, raw_command, host, depth)?
             .to_ascii_lowercase();
-        let arguments = self.expand_splat_arguments(&words[1..]);
+        let arguments = apply_end_of_parameters(self.expand_splat_arguments(&words[1..]));
         let arguments = arguments.as_slice();
         host.emit(
             TraceEvent::new(
@@ -76,19 +102,19 @@ impl PowerShellEmulator {
         );
 
         if let pipeline::PipelineDispatch::Handled(value) =
-            self.execute_pipeline_command(&command, arguments, host, depth)?
+            self.execute_pipeline_command(parser, &command, arguments, host, depth)?
         {
             return Ok(value);
         }
 
         if let content::ContentDispatch::Handled(value) =
-            self.execute_content_command(&command, arguments, host, depth)?
+            self.execute_content_command(parser, &command, arguments, host, depth)?
         {
             return Ok(value);
         }
 
         if let providers::ProviderDispatch::Handled(value) =
-            self.execute_provider_command(&command, arguments, host, depth)?
+            self.execute_provider_command(parser, &command, arguments, host, depth)?
         {
             return Ok(value);
         }
@@ -106,13 +132,13 @@ impl PowerShellEmulator {
         }
 
         if let bits::BitsDispatch::Handled(value) =
-            self.execute_bits_command(&command, arguments, host, depth)?
+            self.execute_bits_command(parser, &command, arguments, host, depth)?
         {
             return Ok(value);
         }
 
         if let builtins::BuiltinDispatch::Handled(value) =
-            self.execute_extended_command(&command, arguments, statement, host, depth)?
+            self.execute_extended_command(parser, &command, arguments, statement, host, depth)?
         {
             return Ok(value);
         }
@@ -129,7 +155,7 @@ impl PowerShellEmulator {
                     .collect::<Vec<_>>();
                 let mut values = Vec::new();
                 for expression in expressions {
-                    let value = self.eval_command_argument(expression, host, depth)?;
+                    let value = self.eval_command_argument(parser, expression, host, depth)?;
                     if !no_enumerate {
                         if let Value::Array(items) = value {
                             values.extend(items);
@@ -169,7 +195,7 @@ impl PowerShellEmulator {
                 let output = arguments
                     .iter()
                     .map(|argument| {
-                        self.eval_command_argument(argument, host, depth)
+                        self.eval_command_argument(parser, argument, host, depth)
                             .map(|value| value.as_string())
                     })
                     .collect::<Result<Vec<_>, _>>()?
@@ -187,7 +213,7 @@ impl PowerShellEmulator {
                 Ok(Some(Value::String(output)))
             }
             "invoke-expression" | "iex" => {
-                let value = self.eval_joined_arguments(arguments, host, depth)?;
+                let value = self.eval_joined_arguments(parser, arguments, host, depth)?;
                 let script = value.as_string();
                 host.add_artifact(
                     ArtifactKind::Script,
@@ -205,28 +231,28 @@ impl PowerShellEmulator {
                     )
                     .with_data("script", limited(&script, 1_024)),
                 );
-                self.execute_script(&script, host, depth + 1)
+                self.execute_source(&script, host, depth + 1)
             }
             "invoke-webrequest" | "iwr" | "invoke-restmethod" | "irm" => {
                 let uri_expression =
                     named_or_positional(arguments, &["-uri"], 0).unwrap_or_default();
                 let uri = self
-                    .eval_expression(&uri_expression, host, depth)?
+                    .eval_expression(parser, &uri_expression, host, depth)?
                     .as_string();
                 let method_expression = named_or_positional(arguments, &["-method"], usize::MAX)
                     .unwrap_or_else(|| "GET".into());
                 let method = self
-                    .eval_expression(&method_expression, host, depth)?
+                    .eval_expression(parser, &method_expression, host, depth)?
                     .as_string()
                     .to_ascii_uppercase();
                 let body_value = named_or_positional(arguments, &["-body"], usize::MAX)
-                    .map(|value| self.eval_expression(&value, host, depth))
+                    .map(|value| self.eval_expression(parser, &value, host, depth))
                     .transpose()?;
                 let headers_value = named_or_positional(arguments, &["-headers"], usize::MAX)
-                    .map(|value| self.eval_expression(&value, host, depth))
+                    .map(|value| self.eval_expression(parser, &value, host, depth))
                     .transpose()?;
                 let content_type = named_or_positional(arguments, &["-contenttype"], usize::MAX)
-                    .map(|value| self.eval_expression(&value, host, depth))
+                    .map(|value| self.eval_expression(parser, &value, host, depth))
                     .transpose()?
                     .map(|value| value.as_string());
                 let session_variable =
@@ -258,7 +284,8 @@ impl PowerShellEmulator {
                 {
                     request_headers.insert(
                         "User-Agent".into(),
-                        self.eval_expression(&user_agent, host, depth)?.as_string(),
+                        self.eval_expression(parser, &user_agent, host, depth)?
+                            .as_string(),
                     );
                 }
                 if let Some(content_type) = &content_type {
@@ -337,7 +364,9 @@ impl PowerShellEmulator {
                 }
                 let output_path = named_or_positional(arguments, &["-outfile"], usize::MAX);
                 if let (Some(response), Some(output_path)) = (&response, output_path) {
-                    let output_path = self.eval_expression(&output_path, host, depth)?.as_string();
+                    let output_path = self
+                        .eval_expression(parser, &output_path, host, depth)?
+                        .as_string();
                     host.write_file(
                         &output_path,
                         &response.body,
@@ -376,11 +405,11 @@ impl PowerShellEmulator {
                 let program_expression =
                     named_or_positional(arguments, &["-filepath"], 0).unwrap_or_default();
                 let program = self
-                    .eval_expression(&program_expression, host, depth)?
+                    .eval_expression(parser, &program_expression, host, depth)?
                     .as_string();
                 let argument_list =
                     named_or_positional(arguments, &["-argumentlist"], 1).unwrap_or_default();
-                let args_value = self.eval_expression(&argument_list, host, depth)?;
+                let args_value = self.eval_expression(parser, &argument_list, host, depth)?;
                 let args = match args_value {
                     Value::Array(values) => {
                         values.into_iter().map(|value| value.as_string()).collect()
@@ -397,19 +426,28 @@ impl PowerShellEmulator {
             | "msbuild" | "msbuild.exe" | "wmic" | "wmic.exe" | "schtasks" | "schtasks.exe"
             | "cmdkey" | "cmdkey.exe" | "certutil" | "certutil.exe" | "bitsadmin"
             | "bitsadmin.exe" => {
-                let args = arguments
-                    .iter()
-                    .map(|argument| {
-                        self.eval_expression(argument, host, depth)
-                            .map(|value| value.as_string())
-                    })
-                    .collect::<Result<Vec<_>, _>>()?;
+                let mut args = Vec::new();
+                let mut verbatim = false;
+                for argument in arguments {
+                    if argument == "--%" {
+                        verbatim = true;
+                        continue;
+                    }
+                    if verbatim {
+                        args.push(argument.clone());
+                    } else {
+                        args.push(
+                            self.eval_expression(parser, argument, host, depth)?
+                                .as_string(),
+                        );
+                    }
+                }
                 Self::spawn(&command, args, "PowerShell command", host, depth)?;
                 Ok(Some(Value::Object("BlockedProcess".into())))
             }
             _ if self.functions.contains_key(&command) => {
                 if let Some(function) = self.functions.get(&command).cloned() {
-                    self.execute_function(&function, arguments, host, depth + 1)
+                    self.execute_function(parser, &function, arguments, host, depth + 1)
                 } else {
                     Ok(None)
                 }
@@ -435,6 +473,7 @@ impl PowerShellEmulator {
 
     pub(crate) fn execute_function(
         &mut self,
+        argument_parser: &ParsedSource,
         function: &FunctionDefinition,
         arguments: &[String],
         host: &mut dyn Host,
@@ -442,7 +481,7 @@ impl PowerShellEmulator {
     ) -> Result<Option<Value>, PowerShellError> {
         let values = arguments
             .iter()
-            .map(|argument| self.eval_expression(argument, host, depth))
+            .map(|argument| self.eval_expression(argument_parser, argument, host, depth))
             .collect::<Result<Vec<_>, _>>()?;
         let outer_variables = self.variables.clone();
         self.variables
@@ -451,13 +490,14 @@ impl PowerShellEmulator {
             let value = if let Some(value) = values.get(index).cloned() {
                 value
             } else if let Some(default) = &parameter.default {
-                self.eval_expression(default, host, depth)?
+                self.eval_expression(&function.parser, default, host, depth)?
             } else {
                 Value::Null
             };
             self.variables.insert(parameter.name.clone(), value);
         }
-        let (result, output) = self.execute_script_collect(&function.body, host, depth)?;
+        let (result, output) =
+            self.execute_script_collect(&function.parser, &function.body, host, depth)?;
         let flow = self.flow.take();
         let globals = self
             .variables
@@ -487,6 +527,7 @@ impl PowerShellEmulator {
 
     pub(crate) fn eval_joined_arguments(
         &mut self,
+        parser: &ParsedSource,
         arguments: &[String],
         host: &mut dyn Host,
         depth: usize,
@@ -494,18 +535,26 @@ impl PowerShellEmulator {
         if arguments.is_empty() {
             return Ok(self.variables.get("input").cloned().unwrap_or(Value::Null));
         }
-        self.eval_expression(&arguments.join(" "), host, depth)
+        if let [argument] = arguments {
+            return self.eval_expression(parser, argument, host, depth);
+        }
+        let expression = arguments.join(" ");
+        let expression_parser = ParsedSource::parse(&expression)
+            .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
+        self.eval_expression(&expression_parser, expression_parser.source(), host, depth)
     }
 
     fn eval_command_argument(
         &mut self,
+        parser: &ParsedSource,
         argument: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Value, PowerShellError> {
         let argument = argument.trim();
-        let expression_like = is_quoted(argument)
-            || is_variable(argument)
+        let expression_like = argument.starts_with(['\'', '"'])
+            || is_quoted(parser, argument)
+            || is_variable(parser, argument)
             || parse_number(argument).is_some()
             || argument.starts_with('(')
             || argument.starts_with('[')
@@ -514,20 +563,23 @@ impl PowerShellEmulator {
             || argument.starts_with("$(")
             || (argument.starts_with('$') && argument.contains('.'));
         if expression_like {
-            self.eval_expression(argument, host, depth)
+            self.eval_expression(parser, argument, host, depth)
         } else {
-            Ok(Value::String(self.interpolate(argument, host, depth)?))
+            Ok(Value::String(
+                self.interpolate(parser, argument, host, depth)?,
+            ))
         }
     }
 
     pub(crate) fn expand_command_name(
         &mut self,
+        parser: &ParsedSource,
         raw: &str,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<String, PowerShellError> {
-        if raw.starts_with('$') || is_quoted(raw) || raw.starts_with('(') {
-            let command = self.eval_expression(raw, host, depth)?.as_string();
+        if raw.starts_with('$') || is_quoted(parser, raw) || raw.starts_with('(') {
+            let command = self.eval_expression(parser, raw, host, depth)?.as_string();
             Ok(self.resolve_command_name(&command))
         } else {
             let command = raw

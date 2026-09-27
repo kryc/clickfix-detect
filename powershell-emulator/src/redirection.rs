@@ -1,16 +1,18 @@
+use crate::parser::ParsedSource;
 use crate::syntax::{RedirectStream, RedirectTarget, Redirection};
 use crate::{Host, PowerShellEmulator, PowerShellError, Value};
 
 impl PowerShellEmulator {
     pub(crate) fn execute_redirected(
         &mut self,
+        parser: &ParsedSource,
         command: &str,
         redirections: &[Redirection],
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Option<Value>, PowerShellError> {
         let error_start = self.error_output.len();
-        let outcome = self.execute_script_collect(command, host, depth);
+        let outcome = self.execute_script_collect(parser, command, host, depth);
         let errors = self
             .error_output
             .split_off(error_start)
@@ -57,12 +59,19 @@ impl PowerShellEmulator {
                     errors_redirected = true;
                     let mut combined = output.clone();
                     combined.extend(errors.clone());
-                    self.write_redirected_output(path, &combined, redirection.append, host, depth)?;
+                    self.write_redirected_output(
+                        parser,
+                        path,
+                        &combined,
+                        redirection.append,
+                        host,
+                        depth,
+                    )?;
                     continue;
                 }
                 RedirectStream::Other(_) => &[],
             };
-            self.write_redirected_output(path, values, redirection.append, host, depth)?;
+            self.write_redirected_output(parser, path, values, redirection.append, host, depth)?;
         }
 
         if let Some((error, _)) = execution_error {

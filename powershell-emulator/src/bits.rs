@@ -1,3 +1,4 @@
+use crate::parser::ParsedSource;
 use crate::syntax::{find_switch, named_or_positional};
 use crate::{Engine, Host, NetworkIntent, PowerShellEmulator, PowerShellError, Value};
 use std::collections::BTreeMap;
@@ -73,6 +74,7 @@ impl PowerShellEmulator {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn execute_bits_command(
         &mut self,
+        parser: &ParsedSource,
         command: &str,
         arguments: &[String],
         host: &mut dyn Host,
@@ -80,13 +82,26 @@ impl PowerShellEmulator {
     ) -> Result<BitsDispatch, PowerShellError> {
         match command {
             "start-bitstransfer" => {
-                let source = self.eval_bits_argument(arguments, &["-source"], 0, host, depth)?;
+                let source =
+                    self.eval_bits_argument(parser, arguments, &["-source"], 0, host, depth)?;
                 let destination =
-                    self.eval_bits_argument(arguments, &["-destination"], 1, host, depth)?;
-                let display_name =
-                    self.eval_bits_argument(arguments, &["-displayname"], usize::MAX, host, depth)?;
-                let description =
-                    self.eval_bits_argument(arguments, &["-description"], usize::MAX, host, depth)?;
+                    self.eval_bits_argument(parser, arguments, &["-destination"], 1, host, depth)?;
+                let display_name = self.eval_bits_argument(
+                    parser,
+                    arguments,
+                    &["-displayname"],
+                    usize::MAX,
+                    host,
+                    depth,
+                )?;
+                let description = self.eval_bits_argument(
+                    parser,
+                    arguments,
+                    &["-description"],
+                    usize::MAX,
+                    host,
+                    depth,
+                )?;
                 self.bits_job_counter = self.bits_job_counter.saturating_add(1);
                 let id = format!("00000000-0000-0000-0000-{:012}", self.bits_job_counter);
                 let mut job = BitsJob {
@@ -143,6 +158,7 @@ impl PowerShellEmulator {
             }
             "get-bitstransfer" => {
                 let name = self.eval_bits_argument(
+                    parser,
                     arguments,
                     &["-name", "-displayname"],
                     usize::MAX,
@@ -161,7 +177,7 @@ impl PowerShellEmulator {
             | "remove-bitstransfer"
             | "suspend-bitstransfer"
             | "resume-bitstransfer" => {
-                let references = self.bits_job_references(arguments, host, depth)?;
+                let references = self.bits_job_references(parser, arguments, host, depth)?;
                 let ids = self.matching_bits_job_ids(&references);
                 for id in ids {
                     match command {
@@ -205,6 +221,7 @@ impl PowerShellEmulator {
 
     fn eval_bits_argument(
         &mut self,
+        parser: &ParsedSource,
         arguments: &[String],
         names: &[&str],
         position: usize,
@@ -214,7 +231,7 @@ impl PowerShellEmulator {
         named_or_positional(arguments, names, position).map_or_else(
             || Ok(String::new()),
             |value| {
-                self.eval_expression(&value, host, depth)
+                self.eval_expression(parser, &value, host, depth)
                     .map(|value| value.as_string())
             },
         )
@@ -222,12 +239,13 @@ impl PowerShellEmulator {
 
     fn bits_job_references(
         &mut self,
+        parser: &ParsedSource,
         arguments: &[String],
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Vec<String>, PowerShellError> {
         let value = named_or_positional(arguments, &["-bitsjob"], 0)
-            .map(|expression| self.eval_expression(&expression, host, depth))
+            .map(|expression| self.eval_expression(parser, &expression, host, depth))
             .transpose()?
             .or_else(|| self.variables.get("input").cloned());
         Ok(value.map_or_else(Vec::new, |value| bits_references(&value)))

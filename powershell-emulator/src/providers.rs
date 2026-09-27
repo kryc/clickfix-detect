@@ -2,6 +2,7 @@ use super::{
     find_switch, named_or_positional, wildcard_match, Engine, EventKind, FunctionDefinition, Host,
     PowerShellEmulator, PowerShellError, ProcessIntent, TraceEvent, Value,
 };
+use crate::parser::ParsedSource;
 use crate::provider_paths::{
     add_filesystem_child, display_provider_path, is_absolute_windows_path, item_base,
     join_provider_path, member_bool, member_string, named_value_item, parent_path,
@@ -20,6 +21,7 @@ impl PowerShellEmulator {
     #[allow(clippy::too_many_lines)]
     pub(crate) fn execute_provider_command(
         &mut self,
+        parser: &ParsedSource,
         command: &str,
         arguments: &[String],
         host: &mut dyn Host,
@@ -27,67 +29,127 @@ impl PowerShellEmulator {
     ) -> Result<ProviderDispatch, PowerShellError> {
         let value = match command {
             "get-item" | "gi" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 self.get_provider_item(&path, host, depth)
             }
             "set-item" | "si" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
-                let value = self.provider_value_argument(arguments, 1, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
+                let value = self.provider_value_argument(parser, arguments, 1, host, depth)?;
                 self.set_provider_item(&path, value, host, depth)?
             }
             "remove-item" | "del" | "erase" | "rm" | "rmdir" | "ri" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 let recurse = find_switch(arguments, "-recurse").is_some();
                 Some(Value::Bool(
                     self.remove_provider_item(&path, recurse, host, depth),
                 ))
             }
             "get-itemproperty" | "gp" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 let name = named_or_positional(arguments, &["-name"], 1)
-                    .map(|name| self.eval_expression(&name, host, depth))
+                    .map(|name| self.eval_expression(parser, &name, host, depth))
                     .transpose()?
                     .map(|name| name.as_string());
                 self.get_item_property(&path, name.as_deref(), host, depth)
             }
             "get-itempropertyvalue" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 let name = named_or_positional(arguments, &["-name"], 1).unwrap_or_default();
-                let name = self.eval_expression(&name, host, depth)?.as_string();
+                let name = self
+                    .eval_expression(parser, &name, host, depth)?
+                    .as_string();
                 self.get_item_property(&path, Some(&name), host, depth)
                     .map(|value| Self::read_member(value, &name))
             }
             "set-itemproperty" | "new-itemproperty" | "sp" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 let name =
                     named_or_positional(arguments, &["-name"], usize::MAX).unwrap_or_default();
-                let name = self.eval_expression(&name, host, depth)?.as_string();
-                let value = self.provider_value_argument(arguments, 2, host, depth)?;
+                let name = self
+                    .eval_expression(parser, &name, host, depth)?
+                    .as_string();
+                let value = self.provider_value_argument(parser, arguments, 2, host, depth)?;
                 Some(self.set_item_property(&path, &name, value, host, depth))
             }
             "remove-itemproperty" | "rp" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 let name = named_or_positional(arguments, &["-name"], 1).unwrap_or_default();
-                let name = self.eval_expression(&name, host, depth)?.as_string();
+                let name = self
+                    .eval_expression(parser, &name, host, depth)?
+                    .as_string();
                 Some(Value::Bool(
                     self.remove_item_property(&path, &name, host, depth),
                 ))
             }
             "get-childitem" | "gci" | "dir" | "ls" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 Some(self.get_provider_children(&path, arguments, host, depth))
             }
             "clear-content" | "clc" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 let target = self.resolve_provider_path(&path);
                 if target.provider == Provider::FileSystem {
                     host.write_file(&target.path, b"", false, Engine::PowerShell, depth)?;
@@ -115,8 +177,14 @@ impl PowerShellEmulator {
                 Some(Self::file_item(&path, &[], false))
             }
             "invoke-item" | "ii" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 let target = self.resolve_provider_path(&path);
                 if target.provider == Provider::FileSystem {
                     host.process_intent(ProcessIntent {
@@ -140,8 +208,14 @@ impl PowerShellEmulator {
             }
             "get-location" | "pwd" | "gl" => Some(self.location_value()),
             "set-location" | "cd" | "chdir" | "sl" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 self.set_current_location(&path);
                 find_switch(arguments, "-passthru")
                     .is_some()
@@ -149,8 +223,14 @@ impl PowerShellEmulator {
             }
             "push-location" | "pushd" => {
                 self.location_stack.push(self.current_location.clone());
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 self.set_current_location(&path);
                 find_switch(arguments, "-passthru")
                     .is_some()
@@ -166,7 +246,7 @@ impl PowerShellEmulator {
                     .then(|| self.location_value())
             }
             "new-item" | "ni" | "mkdir" | "md" => {
-                let path = self.provider_argument(arguments, &["-path"], 0, host, depth)?;
+                let path = self.provider_argument(parser, arguments, &["-path"], 0, host, depth)?;
                 let item_type = if matches!(command, "mkdir" | "md") {
                     "directory".into()
                 } else {
@@ -175,12 +255,18 @@ impl PowerShellEmulator {
                         .trim_matches(['\'', '"'])
                         .to_ascii_lowercase()
                 };
-                let value = self.provider_value_argument(arguments, 1, host, depth)?;
+                let value = self.provider_value_argument(parser, arguments, 1, host, depth)?;
                 self.new_provider_item(&path, &item_type, value, host, depth)?
             }
             "unblock-file" => {
-                let path =
-                    self.provider_argument(arguments, &["-path", "-literalpath"], 0, host, depth)?;
+                let path = self.provider_argument(
+                    parser,
+                    arguments,
+                    &["-path", "-literalpath"],
+                    0,
+                    host,
+                    depth,
+                )?;
                 let target = self.resolve_provider_path(&path);
                 host.emit(
                     TraceEvent::new(
@@ -196,6 +282,7 @@ impl PowerShellEmulator {
             }
             "get-authenticodesignature" => {
                 let path = self.provider_argument(
+                    parser,
                     arguments,
                     &["-filepath", "-literalpath"],
                     0,
@@ -245,6 +332,7 @@ impl PowerShellEmulator {
 
     fn provider_argument(
         &mut self,
+        parser: &ParsedSource,
         arguments: &[String],
         names: &[&str],
         position: usize,
@@ -259,11 +347,14 @@ impl PowerShellEmulator {
         {
             return Ok(expression);
         }
-        Ok(self.eval_expression(&expression, host, depth)?.as_string())
+        Ok(self
+            .eval_expression(parser, &expression, host, depth)?
+            .as_string())
     }
 
     fn provider_value_argument(
         &mut self,
+        parser: &ParsedSource,
         arguments: &[String],
         position: usize,
         host: &mut dyn Host,
@@ -272,7 +363,7 @@ impl PowerShellEmulator {
         let expression = named_or_positional(arguments, &["-value"], usize::MAX)
             .or_else(|| positional_argument(arguments, position))
             .unwrap_or_default();
-        self.eval_expression(&expression, host, depth)
+        self.eval_expression(parser, &expression, host, depth)
     }
 
     fn get_provider_item(
@@ -365,9 +456,11 @@ impl PowerShellEmulator {
                     .strip_prefix("ScriptBlock:")
                     .unwrap_or(&text)
                     .to_owned();
+                let parser = ParsedSource::parse(&body)
+                    .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
                 self.functions.insert(
                     target.path.to_ascii_lowercase(),
-                    FunctionDefinition::parse(&body),
+                    FunctionDefinition::parse(&parser, parser.source()),
                 );
             }
             Provider::Registry => {

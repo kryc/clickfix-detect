@@ -419,10 +419,9 @@ let detector = Detector::default().with_safe_source_policy(safe_sources);
 ## Browser build
 
 `clickfix-wasm` exposes `analyze_payload(payload, input_kind)` for static,
-client-side applications. The browser target uses the span-preserving
-PowerShell tokenizer rather than the native tree-sitter diagnostic pass, while
-retaining the same emulator and detection logic. Real networking is unavailable
-from this wrapper, so analysis remains local to the page.
+client-side applications. Native and browser builds use the same
+span-preserving Rust PowerShell parser and emulator. Real networking is
+unavailable from this wrapper, so analysis remains local to the page.
 
 The companion Azure Static Web Apps project lives at
 `~/clickfix.kryc.uk`. Its build script compiles this workspace for
@@ -431,9 +430,17 @@ them with local Bootstrap assets.
 
 ## Development
 
-The documented MSRV is Rust 1.85. The PowerShell syntax tree uses
-`tree-sitter-powershell` 0.24.5, the newest compatible grammar release for that
-baseline in this workspace.
+The documented MSRV is Rust 1.85. PowerShell input is tokenized once into a
+validated, span-preserving source document. Statement, expression, command, and
+control-flow parsing operate on token ranges from that document. Lexical errors
+such as unterminated strings, here-strings, block comments, and braced variables
+stop emulation before behavioral interpretation. Nonfatal structural diagnostics
+cover mismatched delimiters while still allowing conservative analysis.
+
+The tokenizer follows current PowerShell lexical behavior for nested
+subexpressions in expandable strings, here-string header/footer syntax, Unicode
+variables and whitespace, smart quotes, alternate dash characters,
+null-conditional operators, and the native-command `--%` stop-parsing token.
 
 ```console
 cargo fmt --all --check

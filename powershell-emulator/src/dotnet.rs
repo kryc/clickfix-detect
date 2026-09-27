@@ -998,7 +998,7 @@ impl PowerShellEmulator {
                 if type_name.to_ascii_lowercase().starts_with("scriptblock:") =>
             {
                 let script = type_name.split_once(':').map_or("", |(_, value)| value);
-                self.execute_script(script, host, depth + 1)?
+                self.execute_source(script, host, depth + 1)?
                     .unwrap_or(Value::Null)
             }
             (Value::Object(type_name), "getfield" | "getmethod" | "getproperty")
