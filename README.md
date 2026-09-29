@@ -11,7 +11,7 @@ an explicit bounded public-HTTP(S) opt-in.
 | --- | --- |
 | `emulator-core` | Shared trace events, evidence, artifacts, limits, host traits, and the in-memory virtual host |
 | `cmd-emulator` | Standalone, tokenized and AST-driven `cmd.exe`/batch emulation with virtual files and typed process intents |
-| `powershell-emulator` | Tree-sitter-backed PowerShell parsing and bounded hermetic interpretation |
+| `powershell-emulator` | Span-preserving PowerShell parsing and bounded hermetic interpretation |
 | `windows-script-emulator` | Bounded JScript/VBScript interpreter for WScript, CScript, HTA, scriptlet, and COM behavior |
 | `runbox-emulator` | Windows command dispatch, virtual process recursion, and launcher modeling |
 | `clickfix-detect` | Weighted detection rules, Rust API, human/JSON reports, and the CLI |
@@ -37,8 +37,9 @@ The emulator is hermetic by construction:
 - COM handling recognizes an allowlist of common WSH objects.
 - `rundll32` and `regsvr32` inspect virtual PE bytes and known command patterns;
   native code is never executed.
-- Step, depth, loop, process, file, artifact, and decoding limits are
-  configurable. Reaching a limit is visible in the report.
+- Step, depth, loop, process, file, artifact, decoding, aggregate retained-byte,
+  trace, IOC, and warning limits are configurable. Reaching a limit produces a
+  partial report or a visible limit warning.
 
 Risk and analysis confidence are separate. Unsupported syntax lowers
 confidence but does not make suspicious evidence disappear or reduce its risk
@@ -47,9 +48,11 @@ score.
 Before hashing or emulation, the detector runs an allocation-light candidate
 prefilter over interpreter names, Windows launchers, PowerShell syntax, network
 tools, shell operators, executable/script extensions, and encoding markers.
-Clearly irrelevant clipboard text returns a lightweight Benign report with no
-SHA-256 or trace. Candidate inputs alone are hashed and passed into runbox.
-Inputs larger than 1 MiB are rejected before hashing.
+Clipboard text with no known signals returns a lightweight prefilter-only
+Benign report with no SHA-256 or trace. Candidate inputs alone are hashed and
+passed into runbox. Use thorough analysis when a caller requires emulation
+regardless of the hot-path decision. Inputs larger than 1 MiB are rejected
+before hashing.
 
 ## Current compatibility tier
 
@@ -123,7 +126,9 @@ cat sample.ps1 | cargo run -p clickfix-detect -- --kind powershell
 ```
 
 `--kind auto` is the default. Use `--max-steps` and `--max-depth` to override
-the main resource budgets.
+the main resource budgets. `--analysis-mode hot-path` is the default and
+permits prefilter-only reports; `--analysis-mode thorough` always attempts
+emulation.
 
 Real network access is disabled by default. `--allow-network` enables public
 HTTP and HTTPS requests for `clickfix-detect`, `powershell-emulator`, and
@@ -135,12 +140,17 @@ limit. Exact `VirtualHost` fixtures still take precedence. Enabling networking
 can retrieve real malicious bytes, but all process, filesystem, registry, DLL,
 and script effects remain virtual or modeled.
 
+Every report exposes `analysis_mode` and `analysis_status` (`prefilter_only`,
+`emulated`, or `partial`). A partial report retains evidence collected before
+a parser or resource-limit failure.
+
 Every report exposes `network_urls` for direct reputation lookups and
 `network_activity` for full context. Each activity record includes the HTTP
 method, URL, origin, analysis depth, outcome (`blocked`, `fixture`, `fetched`,
-or `failed`), response status/size when available, and any failure reason.
-Attempted URLs are recorded even when access is disabled or rejected by the
-public-destination policy.
+or `failed`), redirect destinations and final URL when available, response
+status/size, and any failure reason. Attempted URLs are recorded even when
+access is disabled or rejected by the public-destination policy. Sensitive
+authorization and cookie headers are removed on cross-origin redirects.
 
 The detector also supports trusted source URLs for known-good installers and
 bootstrap scripts. `https://gh.io/copilot-install` is trusted by default, so
@@ -379,6 +389,10 @@ for url in &report.network_urls {
 path. Browser clipboard integrations can call
 `clickfix_wasm::prefilter_payload` and invoke full analysis only for a
 `candidate` decision.
+
+`Detector::analyze` preserves hot-path behavior. `Detector::analyze_full`
+always attempts emulation, while `Detector::analyze_with_mode` accepts an
+explicit `AnalysisMode`.
 
 Network policy and virtual environment contents are configurable through the
 library APIs:

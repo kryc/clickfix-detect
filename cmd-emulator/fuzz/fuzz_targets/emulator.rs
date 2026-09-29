@@ -19,6 +19,7 @@ fuzz_target!(|data: &[u8]| {
         max_child_processes: 16,
         max_artifact_bytes: 64 * 1024,
         max_virtual_files: 128,
+        ..AnalysisLimits::default()
     });
     let mut emulator = CmdEmulator::new();
     let _ = emulator.emulate_batch(source, &mut host, 0);

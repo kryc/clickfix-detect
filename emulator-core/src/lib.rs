@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use thiserror::Error;
 
 mod network;
@@ -9,6 +9,7 @@ pub mod windows;
 pub use network::NetworkPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct AnalysisLimits {
     pub max_steps: usize,
     pub max_depth: usize,
@@ -16,7 +17,13 @@ pub struct AnalysisLimits {
     pub max_decode_passes: usize,
     pub max_child_processes: usize,
     pub max_artifact_bytes: usize,
+    pub max_artifacts: usize,
+    pub max_total_artifact_bytes: usize,
     pub max_virtual_files: usize,
+    pub max_total_virtual_file_bytes: usize,
+    pub max_trace_events: usize,
+    pub max_iocs: usize,
+    pub max_warnings: usize,
 }
 
 impl Default for AnalysisLimits {
@@ -28,7 +35,13 @@ impl Default for AnalysisLimits {
             max_decode_passes: 12,
             max_child_processes: 64,
             max_artifact_bytes: 4 * 1024 * 1024,
+            max_artifacts: 256,
+            max_total_artifact_bytes: 16 * 1024 * 1024,
             max_virtual_files: 1_024,
+            max_total_virtual_file_bytes: 16 * 1024 * 1024,
+            max_trace_events: 50_000,
+            max_iocs: 4_096,
+            max_warnings: 1_024,
         }
     }
 }
@@ -227,6 +240,10 @@ pub enum NetworkOutcome {
 pub struct NetworkActivity {
     pub method: String,
     pub url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub final_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub redirect_urls: Vec<String>,
     pub origin: String,
     pub depth: usize,
     pub outcome: NetworkOutcome,
@@ -255,6 +272,14 @@ struct VirtualFile {
     truncated: bool,
     executable: bool,
     baseline: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum RetentionLimit {
+    Trace,
+    Ioc,
+    Artifact,
+    Warning,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -424,6 +449,7 @@ pub struct VirtualHost {
     unsupported_operations: usize,
     limits_reached: usize,
     child_processes: usize,
+    retention_limits_reached: BTreeSet<RetentionLimit>,
 }
 
 impl VirtualHost {
@@ -468,6 +494,7 @@ impl VirtualHost {
             unsupported_operations: 0,
             limits_reached: 0,
             child_processes: 0,
+            retention_limits_reached: BTreeSet::new(),
         }
     }
 
@@ -836,6 +863,22 @@ impl VirtualHost {
         ));
     }
 
+    fn push_bounded_warning(&mut self, warning: String) {
+        if self.warnings.contains(&warning) {
+            return;
+        }
+        if self.warnings.len() >= self.limits.max_warnings {
+            if self
+                .retention_limits_reached
+                .insert(RetentionLimit::Warning)
+            {
+                self.limits_reached += 1;
+            }
+            return;
+        }
+        self.warnings.push(warning);
+    }
+
     fn ensure_parent_directories(&mut self, path: &str) {
         let Some((parent, _)) = path.rsplit_once('\\') else {
             return;
@@ -883,6 +926,8 @@ impl VirtualHost {
         self.network_activity.push(NetworkActivity {
             method: intent.method.clone(),
             url: intent.url.clone(),
+            final_url: None,
+            redirect_urls: Vec::new(),
             origin: intent.origin.clone(),
             depth: intent.depth,
             outcome,
@@ -924,6 +969,42 @@ impl VirtualHost {
             event
                 .data
                 .insert("response_bytes".into(), response.body.len().to_string());
+        }
+    }
+
+    fn record_network_fetch(&mut self, activity_index: usize, fetch: &network::NetworkFetch) {
+        self.record_network_response(activity_index, &fetch.response, NetworkOutcome::Fetched);
+        if let Some(activity) = self.network_activity.get_mut(activity_index) {
+            activity.final_url = Some(fetch.final_url.clone());
+            activity.redirect_urls.clone_from(&fetch.redirects);
+        }
+        let depth = self
+            .network_activity
+            .get(activity_index)
+            .map_or(0, |activity| activity.depth);
+        for url in &fetch.redirects {
+            self.add_ioc(Ioc {
+                kind: IocKind::Url,
+                value: url.clone(),
+                source: "network redirect".into(),
+                depth,
+            });
+            if let Some(domain) = extract_url_host(url) {
+                self.add_ioc(Ioc {
+                    kind: IocKind::Domain,
+                    value: domain,
+                    source: "network redirect".into(),
+                    depth,
+                });
+            }
+        }
+        if let Some(event) = self.trace.last_mut() {
+            event
+                .data
+                .insert("final_url".into(), fetch.final_url.clone());
+            event
+                .data
+                .insert("redirects".into(), fetch.redirects.len().to_string());
         }
     }
 
@@ -973,6 +1054,13 @@ impl Host for VirtualHost {
     }
 
     fn emit(&mut self, mut event: TraceEvent) {
+        if self.trace.len() >= self.limits.max_trace_events {
+            if self.retention_limits_reached.insert(RetentionLimit::Trace) {
+                self.limits_reached += 1;
+                self.push_bounded_warning("trace event limit reached".into());
+            }
+            return;
+        }
         event.sequence = self.trace.len() + 1;
         self.trace.push(event);
     }
@@ -983,6 +1071,13 @@ impl Host for VirtualHost {
             .iter()
             .any(|existing| existing.kind == ioc.kind && existing.value == ioc.value)
         {
+            if self.iocs.len() >= self.limits.max_iocs {
+                if self.retention_limits_reached.insert(RetentionLimit::Ioc) {
+                    self.limits_reached += 1;
+                    self.push_bounded_warning("IOC limit reached".into());
+                }
+                return;
+            }
             self.iocs.push(ioc);
         }
     }
@@ -995,12 +1090,29 @@ impl Host for VirtualHost {
         bytes: &[u8],
         depth: usize,
     ) -> usize {
-        let truncated = bytes.len() > self.limits.max_artifact_bytes;
-        let stored = if truncated {
-            &bytes[..self.limits.max_artifact_bytes]
-        } else {
-            bytes
-        };
+        if self.artifacts.len() >= self.limits.max_artifacts {
+            if self
+                .retention_limits_reached
+                .insert(RetentionLimit::Artifact)
+            {
+                self.record_limit(Engine::Runbox, depth, "artifact count limit reached");
+            }
+            return 0;
+        }
+        let retained_bytes = self
+            .artifacts
+            .iter()
+            .filter_map(|artifact| artifact.text.as_ref())
+            .map(String::len)
+            .sum::<usize>();
+        let retained_limit = self
+            .limits
+            .max_total_artifact_bytes
+            .saturating_sub(retained_bytes)
+            .min(self.limits.max_artifact_bytes)
+            .min(bytes.len());
+        let stored = &bytes[..retained_limit];
+        let truncated = retained_limit < bytes.len();
         let id = self.artifacts.len() + 1;
         self.artifacts.push(Artifact {
             id,
@@ -1026,7 +1138,7 @@ impl Host for VirtualHost {
             self.record_limit(
                 Engine::Runbox,
                 depth,
-                format!("artifact {name} was truncated"),
+                format!("artifact {name} was truncated by retention limits"),
             );
         }
         id
@@ -1051,6 +1163,26 @@ impl Host for VirtualHost {
             return Err(HostError::FileLimit);
         }
 
+        let existing_len = self
+            .files
+            .get(&normalized)
+            .filter(|file| !file.baseline)
+            .map_or(0, |file| file.bytes.len());
+        let retained_file_bytes = self
+            .files
+            .values()
+            .filter(|file| !file.baseline)
+            .map(|file| file.bytes.len())
+            .sum::<usize>();
+        let retained_without_target = if append {
+            retained_file_bytes
+        } else {
+            retained_file_bytes.saturating_sub(existing_len)
+        };
+        let total_remaining = self
+            .limits
+            .max_total_virtual_file_bytes
+            .saturating_sub(retained_without_target);
         let file = self.files.entry(normalized.clone()).or_insert(VirtualFile {
             bytes: Vec::new(),
             truncated: false,
@@ -1060,12 +1192,13 @@ impl Host for VirtualHost {
         file.baseline = false;
         if !append {
             file.bytes.clear();
+            file.truncated = false;
         }
         let remaining = self
             .limits
             .max_artifact_bytes
             .saturating_sub(file.bytes.len());
-        let accepted = bytes.len().min(remaining);
+        let accepted = bytes.len().min(remaining).min(total_remaining);
         file.bytes.extend_from_slice(&bytes[..accepted]);
         if accepted < bytes.len() {
             file.truncated = true;
@@ -1429,13 +1562,9 @@ impl Host for VirtualHost {
         }
         if self.network_policy.enabled {
             return match network::send(&self.network_policy, &request) {
-                Ok(response) => {
-                    self.record_network_response(
-                        activity_index,
-                        &response,
-                        NetworkOutcome::Fetched,
-                    );
-                    Some(response)
+                Ok(fetch) => {
+                    self.record_network_fetch(activity_index, &fetch);
+                    Some(fetch.response)
                 }
                 Err(error) => {
                     self.record_network_failure(activity_index, &error);
@@ -1491,13 +1620,9 @@ impl Host for VirtualHost {
         }
         if self.network_policy.enabled {
             return match network::send(&self.network_policy, &request) {
-                Ok(response) => {
-                    self.record_network_response(
-                        activity_index,
-                        &response,
-                        NetworkOutcome::Fetched,
-                    );
-                    Some(response)
+                Ok(fetch) => {
+                    self.record_network_fetch(activity_index, &fetch);
+                    Some(fetch.response)
                 }
                 Err(error) => {
                     self.record_network_failure(activity_index, &error);
@@ -1534,9 +1659,7 @@ impl Host for VirtualHost {
     }
 
     fn warning(&mut self, warning: String) {
-        if !self.warnings.contains(&warning) {
-            self.warnings.push(warning);
-        }
+        self.push_bounded_warning(warning);
     }
 }
 
@@ -1584,6 +1707,68 @@ mod tests {
             snapshot.network_activity[0].outcome,
             NetworkOutcome::Blocked
         );
+    }
+
+    #[test]
+    fn aggregate_retention_limits_bound_host_state() {
+        let limits = AnalysisLimits {
+            max_artifact_bytes: 8,
+            max_artifacts: 1,
+            max_total_artifact_bytes: 4,
+            max_virtual_files: 4,
+            max_total_virtual_file_bytes: 5,
+            max_trace_events: 1,
+            max_iocs: 1,
+            max_warnings: 4,
+            ..AnalysisLimits::default()
+        };
+        let mut host = VirtualHost::new(limits);
+
+        host.add_artifact(
+            ArtifactKind::DecodedText,
+            "first",
+            "text/plain",
+            b"abcdefgh",
+            0,
+        );
+        host.add_artifact(
+            ArtifactKind::DecodedText,
+            "second",
+            "text/plain",
+            b"ignored",
+            0,
+        );
+        host.add_virtual_file(r"C:\one.bin", b"1234").unwrap();
+        host.add_virtual_file(r"C:\two.bin", b"5678").unwrap();
+        host.add_ioc(Ioc {
+            kind: IocKind::Domain,
+            value: "one.invalid".into(),
+            source: "test".into(),
+            depth: 0,
+        });
+        host.add_ioc(Ioc {
+            kind: IocKind::Domain,
+            value: "two.invalid".into(),
+            source: "test".into(),
+            depth: 0,
+        });
+
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot.artifacts.len(), 1);
+        assert_eq!(snapshot.artifacts[0].text.as_deref(), Some("abcd"));
+        assert!(snapshot.artifacts[0].truncated);
+        assert_eq!(
+            snapshot
+                .virtual_files
+                .iter()
+                .map(|file| file.size)
+                .sum::<usize>(),
+            5
+        );
+        assert_eq!(snapshot.trace.len(), 1);
+        assert_eq!(snapshot.iocs.len(), 1);
+        assert!(snapshot.limits_reached >= 3);
+        assert!(!snapshot.warnings.is_empty());
     }
 
     #[test]

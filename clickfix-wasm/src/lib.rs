@@ -1,4 +1,4 @@
-use clickfix_detect::{Detector, DetectorInput, PrefilterDecision};
+use clickfix_detect::{AnalysisMode, Detector, DetectorInput, InputKind};
 use serde::Serialize;
 use wasm_bindgen::prelude::*;
 
@@ -36,23 +36,40 @@ struct WasmAnalysis<T> {
 /// or the report cannot be converted to a JavaScript value.
 #[wasm_bindgen]
 pub fn analyze_payload(payload: &str, input_kind: &str) -> Result<JsValue, JsValue> {
+    analyze_payload_with_mode(payload, input_kind, AnalysisMode::HotPath)
+}
+
+/// Analyze one payload without allowing the prefilter to skip emulation.
+///
+/// # Errors
+///
+/// Returns a JavaScript error when the input kind is invalid, analysis fails,
+/// or the report cannot be converted to a JavaScript value.
+#[wasm_bindgen]
+pub fn analyze_payload_thorough(payload: &str, input_kind: &str) -> Result<JsValue, JsValue> {
+    analyze_payload_with_mode(payload, input_kind, AnalysisMode::Thorough)
+}
+
+fn analyze_payload_with_mode(
+    payload: &str,
+    input_kind: &str,
+    analysis_mode: AnalysisMode,
+) -> Result<JsValue, JsValue> {
     let mode = InputMode::parse(input_kind)?;
-    let prefilter = Detector::prefilter(payload);
-    let (kind, input) = match mode {
-        InputMode::PowerShell => ("powershell", DetectorInput::powershell_script(payload)),
-        InputMode::Auto
-            if prefilter.decision == PrefilterDecision::Candidate
-                && looks_like_powershell(payload) =>
-        {
-            ("powershell", DetectorInput::powershell_script(payload))
-        }
-        InputMode::Auto | InputMode::Command => ("command", DetectorInput::raw_command(payload)),
+    let kind = match mode {
+        InputMode::PowerShell => InputKind::PowerShellScript,
+        InputMode::Command => InputKind::RawCommand,
+        InputMode::Auto => Detector::infer_input_kind(payload),
+    };
+    let (kind_name, input) = match kind {
+        InputKind::PowerShellScript => ("powershell", DetectorInput::powershell_script(payload)),
+        InputKind::RawCommand => ("command", DetectorInput::raw_command(payload)),
     };
     let report = Detector::default()
-        .analyze(input)
+        .analyze_with_mode(input, analysis_mode)
         .map_err(|error| JsValue::from_str(&error.to_string()))?;
     serde_wasm_bindgen::to_value(&WasmAnalysis {
-        input_kind: kind,
+        input_kind: kind_name,
         report,
     })
     .map_err(|error| JsValue::from_str(&error.to_string()))
@@ -76,27 +93,19 @@ pub fn detector_version() -> String {
     env!("CARGO_PKG_VERSION").into()
 }
 
-fn looks_like_powershell(content: &str) -> bool {
-    let lowercase = content.to_ascii_lowercase();
-    content.contains('\n')
-        || content.trim_start().starts_with('$')
-        || lowercase.contains("invoke-webrequest")
-        || lowercase.contains("invoke-restmethod")
-        || lowercase.contains("invoke-expression")
-        || lowercase.contains("set-content")
-        || lowercase.contains("[system.")
-        || lowercase.contains("[text.")
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn auto_mode_recognizes_powershell() {
-        assert!(looks_like_powershell(
-            "Invoke-WebRequest https://example.invalid"
-        ));
-        assert!(!looks_like_powershell("mshta https://example.invalid"));
+        assert_eq!(
+            Detector::infer_input_kind("Invoke-WebRequest https://example.invalid"),
+            InputKind::PowerShellScript
+        );
+        assert_eq!(
+            Detector::infer_input_kind("mshta https://example.invalid"),
+            InputKind::RawCommand
+        );
     }
 }

