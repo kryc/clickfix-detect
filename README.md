@@ -423,11 +423,6 @@ client-side applications. Native and browser builds use the same
 span-preserving Rust PowerShell parser and emulator. Real networking is
 unavailable from this wrapper, so analysis remains local to the page.
 
-The companion Azure Static Web Apps project lives at
-`~/clickfix.kryc.uk`. Its build script compiles this workspace for
-`wasm32-unknown-unknown`, generates wasm-bindgen browser bindings, and bundles
-them with local Bootstrap assets.
-
 ## Development
 
 The documented MSRV is Rust 1.85. PowerShell input is tokenized once into a
