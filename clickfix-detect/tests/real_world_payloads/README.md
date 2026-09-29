@@ -36,10 +36,23 @@ filesystem write occurs.
 | Zscaler | [COLDRIVER Updates Its Arsenal](https://www.zscaler.com/blogs/security-research/coldriver-updates-arsenal-baitswitch-and-simplefix) | Remote UNC `rundll32` command |
 | Zscaler | [Technical Analysis of MLTBackdoor](https://www.zscaler.com/blogs/security-research/technical-analysis-mltbackdoor) | Templated headless `conhost` chain |
 | The DFIR Report | [KongTuke FileFix Leads to New Interlock RAT Variant](https://thedfirreport.com/2025/07/14/kongtuke-filefix-leads-to-new-interlock-rat-variant/) | PowerShell/WebClient Interlock loader command |
+| BlackCloak | [Social Engineering Meets Shell Script Malware](https://kb.blackcloak.io/en/articles/9433217) | macOS `/bin/bash -c "$(curl ...)"` launcher and download/xattr/chmod/execute stage |
+| Recorded Future Insikt Group | [ClickFix Campaigns Targeting Windows and macOS](https://assets.recordedfuture.com/insikt-report-pdfs/2026/cta-2026-0325.pdf) | Odyssey Base64/nohup Bash command, decoded command, and MacSync Base64/zsh command |
+| Netskope Threat Labs | [macOS ClickFix Lures Deploy AppleScript Stealer & Persistent RAT](https://www.netskope.com/blog/macos-clickfix-lures-deploy-applescript-stealer-persistent-rat) | AppleScript download pipe and Base64 temporary-script execution command |
+| ADAMnetworks / Techie Mike | [ClickFix: The Fake CAPTCHA That Tricks You Into Hacking Yourself](https://www.techiemike.com/clickfix-fake-captcha/) | Redacted PasteSwitch export/curl/zsh command shape |
+| Hunt.io | [APT36-Style ClickFix Attack Spoofs Indian Ministry to Target Windows & Linux](https://hunt.io/blog/apt36-clickfix-campaign-indian-ministry-of-defence) | Reconstructed Linux download/chmod/execute command from the publication's described URL, filename, and actions |
+| Purpleshift | [Hack yourself: breaking down ClickFix](https://purpleshift.io/articles/2026-08-24-clickfix/) | Three explicitly representative Linux curl/wget/download-chmod shell patterns |
 
 `Truncated` fixture metadata means the publication itself used a placeholder,
 generalized host, omitted argument, or shortened encoded value. Tests do not
 attempt to reconstruct missing content.
+
+`Reconstructed` means the publication supplied the URL, filename, and ordered
+actions but did not publish a copyable one-line command. The fixture is a
+minimal shell reconstruction and is never presented as a byte-exact capture.
+
+`Representative` means the source explicitly published the command as a common
+Linux ClickFix pattern rather than attributing it to one named campaign.
 
 ## Coverage gaps exposed by the corpus
 
@@ -71,6 +84,28 @@ attempt to reconstruct missing content.
    screenshots; others replace encoded bodies or hosts with placeholders.
    Those cannot support byte-exact fixtures until a textual primary source is
    available.
+8. **Linux evidence scarcity:** Linux-targeting campaigns are publicly
+   documented, but primary reports rarely publish verbatim clipboard command
+   text. The Hunt.io fixture is therefore marked `Reconstructed`, and the
+   Purpleshift fixtures are marked `Representative`.
+9. **Secondary-stage retrieval:** first-stage curl/wget commands are modeled,
+   but public reports often omit the returned shell, AppleScript, Mach-O, or
+   ELF bytes. Add fixture-backed secondary-stage samples when publications
+   provide hashes and recoverable content.
+10. **macOS native formats and installers:** Mach-O execution, universal
+    binaries, DMG mounting, PKG installation, `hdiutil`, `installer`,
+    `codesign`, `security`, and `dscl` are not yet modeled.
+11. **AppleScript and JXA depth:** `osascript` captures scripts, URLs, and
+    recursively dispatches `do shell script`, but it does not interpret general
+    AppleScript/JXA stealer logic, Keychain access, browser data collection, or
+    LaunchAgent creation.
+12. **Dynamic C2 command extraction:** Base64 decode/write/chmod/execute chains
+    are correlated, but full `sed`/JSON extraction from server responses and
+    arbitrary dynamic command provenance remain incomplete.
+13. **Linux native execution:** chmod-marked shell scripts can recurse through
+    Bash, but ELF inspection, shared-object loading, `LD_PRELOAD`, kernel/module
+    operations, container escapes, and architecture-specific loaders are not
+    modeled.
 
 The corpus also exposed and now covers several fixed gaps: blocked or invalid
 archive content no longer aborts analysis; Windows Run environment variables
@@ -78,6 +113,11 @@ are expanded; `finger.exe` emits a typed network intent; `START` can proxy cmd
 internal commands; unquoted `FOR /F` options are tolerated after nested parsing;
 and nested child syntax errors are reported without discarding the parent
 analysis.
+
+The macOS/Linux corpus additionally fixed and now covers POSIX `base64 -d/-D`,
+shell execution from pipeline stdin, macOS `nohup`, `sh`/`zsh`/`osascript`
+download-execution correlation, wget chains, extensionless chmod-marked
+executables, and decode/write/execute behavior.
 
 Detector expectations distinguish provenance from standalone behavior. Complete
 remote-launch and download/execute commands must be `Malicious`; incomplete

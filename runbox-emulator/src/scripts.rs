@@ -307,6 +307,8 @@ impl Runbox {
         let content = String::from_utf8_lossy(&bytes);
         if extension == "ps1" {
             self.emulate_powershell(&content, depth + 1)
+        } else if matches!(extension.as_str(), "sh" | "command") {
+            self.emulate_bash_with_args(&content, path.trim_matches('"'), arguments, depth + 1)
         } else if matches!(extension.as_str(), "cmd" | "bat") {
             let mut emulator = CmdEmulator::new();
             emulator.emulate_batch_with_args(

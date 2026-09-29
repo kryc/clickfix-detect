@@ -2,6 +2,7 @@
 members = [
     "emulator-core",
     "cmd-emulator",
+    "bash-emulator",
     "powershell-emulator",
     "windows-script-emulator",
     "runbox-emulator",

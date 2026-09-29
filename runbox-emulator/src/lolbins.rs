@@ -137,9 +137,19 @@ impl Runbox {
             origin: format!("runbox {program}"),
             depth,
         });
-        if let (Some(response), Some(output)) = (response, output) {
-            self.host
-                .write_file(&output, &response.body, false, Engine::Runbox, depth)?;
+        if let Some(response) = response {
+            if let Some(output) = output {
+                self.host
+                    .write_file(&output, &response.body, false, Engine::Runbox, depth)?;
+            } else {
+                for line in String::from_utf8_lossy(&response.body).lines() {
+                    self.host.emit(
+                        TraceEvent::new(depth, Engine::Runbox, EventKind::Output, line)
+                            .with_data("stream", "stdout")
+                            .with_data("exit_code", "0"),
+                    );
+                }
+            }
         }
         Ok(())
     }

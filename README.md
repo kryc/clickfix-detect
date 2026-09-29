@@ -11,6 +11,7 @@ an explicit bounded public-HTTP(S) opt-in.
 | --- | --- |
 | `emulator-core` | Shared trace events, evidence, artifacts, limits, host traits, and the in-memory virtual host |
 | `cmd-emulator` | Standalone, tokenized and AST-driven `cmd.exe`/batch emulation with virtual files and typed process intents |
+| `bash-emulator` | Standalone, tokenized and AST-driven Bash emulation on deterministic virtual macOS and Linux hosts |
 | `powershell-emulator` | Span-preserving PowerShell parsing and bounded hermetic interpretation |
 | `windows-script-emulator` | Bounded JScript/VBScript interpreter for WScript, CScript, HTA, scriptlet, and COM behavior |
 | `runbox-emulator` | Windows command dispatch, virtual process recursion, and launcher modeling |
@@ -18,7 +19,8 @@ an explicit bounded public-HTTP(S) opt-in.
 | `clickfix-wasm` | Browser-safe wasm-bindgen wrapper around `clickfix-detect` |
 
 Dependencies flow from `clickfix-detect` to `runbox-emulator`, which dispatches
-to `powershell-emulator`, `cmd-emulator`, and `windows-script-emulator`.
+to `powershell-emulator`, `cmd-emulator`, `bash-emulator`, and
+`windows-script-emulator`.
 Cross-emulator Windows primitives live under `emulator_core::windows`. Every
 package uses the contracts in `emulator-core`; external commands return typed
 synchronous results when runbox has a model and remain deferred intents
@@ -104,7 +106,19 @@ before hashing.
   child PowerShell or cmd payloads through runbox.
 - DLL launchers: scriptlet/JavaScript interpretation, URL extraction, hashes,
   and printable-string inspection of virtual PE files.
-- Shell associations: `.ps1`, `.cmd`, `.bat`, `.js`, `.vbs`, and `.hta`.
+- Shell associations: `.ps1`, `.cmd`, `.bat`, `.js`, `.vbs`, `.hta`, `.sh`,
+  and `.command`.
+- Bash/macOS: span-preserving shell tokenization; variables, parameter defaults,
+  positional parameters, command and arithmetic substitution; command lists,
+  pipelines, functions, groups, subshells, `if`, `for`, `while`, and `until`;
+  virtual POSIX files and directories; common shell/file/text builtins; typed
+  external process intents; `bash`, `sh`, and `zsh` dispatch; and modeled
+  `osascript`, `launchctl`, `open`, `chmod`, `xattr`, `spctl`, `defaults`, and
+  `scutil` behavior.
+- Bash/Linux: deterministic `/home/analysis`, systemd, cron, init, package,
+  privilege-wrapper, interpreter, base64, identity, file-discovery,
+  remote-access, firewall, and security-control models. `sudo`, `nohup`,
+  `setsid`, `timeout`, and `chroot` recursively dispatch nested commands.
 
 Unsupported operations are always traced explicitly. The project does not
 claim complete Windows PowerShell, JScript, VBScript, COM, DOM, or Win32
@@ -140,9 +154,11 @@ limit. Exact `VirtualHost` fixtures still take precedence. Enabling networking
 can retrieve real malicious bytes, but all process, filesystem, registry, DLL,
 and script effects remain virtual or modeled.
 
-Every report exposes `analysis_mode` and `analysis_status` (`prefilter_only`,
-`emulated`, or `partial`). A partial report retains evidence collected before
-a parser or resource-limit failure.
+Every report exposes `analysis_mode`, `analysis_status` (`prefilter_only`,
+`emulated`, or `partial`), and `host_platform` (`windows`, `mac_os`, or
+`linux`). A
+partial report retains evidence collected before a parser or resource-limit
+failure.
 
 Every report exposes `network_urls` for direct reputation lookups and
 `network_activity` for full context. Each activity record includes the HTTP
@@ -233,6 +249,21 @@ C:\Users\analysis> type test.txt
 
 Cmd does not treat single quotes as quoting characters, so they are retained
 in the file contents.
+
+The Bash emulator provides the matching macOS-oriented shell boundary:
+
+```console
+cargo run -p bash-emulator -- -c 'name=world; echo "hello $name"'
+cargo run -p bash-emulator -- --file samples/bash/01-basics.sh --arg one
+cargo run -p bash-emulator -- --platform linux -c 'pwd; cat /etc/os-release'
+cargo run -p clickfix-detect -- --kind linux-bash --file samples/linux/01-systemd.sh
+cat samples/bash/02-files-and-pipelines.sh | cargo run -p bash-emulator
+```
+
+It defaults to a deterministic `/Users/analysis` macOS environment; use
+`--platform linux` for `/home/analysis` and Linux directories/executables.
+External commands become typed process intents; runbox synchronously models
+supported utilities and recursively dispatches `bash`, `sh`, and `zsh`.
 
 The Windows script emulator can be used directly for JScript, VBScript, HTA,
 and scriptlet compatibility work:
@@ -497,6 +528,9 @@ cargo +nightly fuzz run emulator -- -max_len=65536
 
 `windows-script-emulator/fuzz` provides the same tokenizer and full-emulator
 targets for JScript, VBScript, HTA, and scriptlet seeds.
+
+`bash-emulator/fuzz` provides matching tokenizer and full-emulator targets with
+shell quoting, substitution, pipeline, function, and control-flow seeds.
 
 Synthetic fixtures use reserved `example.invalid` destinations and inert
 content. No license is currently granted; no license file is included.

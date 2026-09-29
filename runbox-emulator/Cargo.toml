@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 base64.workspace = true
+bash-emulator = { path = "../bash-emulator" }
 emulator-core = { path = "../emulator-core" }
 cmd-emulator = { path = "../cmd-emulator" }
 powershell-emulator = { path = "../powershell-emulator" }

@@ -29,7 +29,7 @@ pub(crate) fn basename(path: &str) -> &str {
 pub(crate) fn has_script_extension(path: &str) -> bool {
     matches!(
         extension(path).as_str(),
-        "ps1" | "cmd" | "bat" | "js" | "vbs" | "hta"
+        "ps1" | "cmd" | "bat" | "js" | "vbs" | "hta" | "sh" | "command"
     )
 }
 

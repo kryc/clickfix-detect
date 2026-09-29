@@ -22,7 +22,7 @@ struct Arguments {
     #[arg(long, short)]
     file: Option<PathBuf>,
 
-    /// Interpret the input as a command or a `PowerShell` script.
+    /// Interpret the input as a command, `PowerShell` script, or Bash script.
     #[arg(long, value_enum, default_value = "auto")]
     kind: CliInputKind,
 
@@ -68,6 +68,8 @@ enum CliInputKind {
     Auto,
     Command,
     Powershell,
+    Bash,
+    LinuxBash,
 }
 
 #[derive(Debug, Clone, Copy, ValueEnum)]
@@ -408,12 +410,19 @@ fn select_kind(kind: CliInputKind, content: &str, path: Option<&PathBuf>) -> Inp
     match kind {
         CliInputKind::Command => InputKind::RawCommand,
         CliInputKind::Powershell => InputKind::PowerShellScript,
+        CliInputKind::Bash => InputKind::BashScript,
+        CliInputKind::LinuxBash => InputKind::LinuxShellScript,
         CliInputKind::Auto => {
             if path.is_some_and(|path| {
                 path.extension()
                     .is_some_and(|extension| extension.eq_ignore_ascii_case("ps1"))
             }) {
                 InputKind::PowerShellScript
+            } else if path.is_some_and(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("command"))
+            }) {
+                InputKind::BashScript
             } else {
                 Detector::infer_input_kind(content)
             }

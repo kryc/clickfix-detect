@@ -1,10 +1,13 @@
 use base64::{engine::general_purpose::STANDARD, Engine as _};
 use clickfix_detect::{Detector, DetectorInput, PrefilterDecision, Verdict};
+use emulator_core::HostPlatform;
 
 #[derive(Debug, Clone, Copy)]
 enum PublicationCompleteness {
     Complete,
     Truncated,
+    Reconstructed,
+    Representative,
 }
 
 #[derive(Clone, Copy)]
@@ -42,6 +45,15 @@ const ZSCALER_MLT_SOURCE: &str =
     "https://www.zscaler.com/blogs/security-research/technical-analysis-mltbackdoor";
 const DFIR_SOURCE: &str =
     "https://thedfirreport.com/2025/07/14/kongtuke-filefix-leads-to-new-interlock-rat-variant/";
+const BLACKCLOAK_SOURCE: &str = "https://kb.blackcloak.io/en/articles/9433217";
+const RECORDED_FUTURE_SOURCE: &str =
+    "https://assets.recordedfuture.com/insikt-report-pdfs/2026/cta-2026-0325.pdf";
+const NETSKOPE_MACOS_SOURCE: &str =
+    "https://www.netskope.com/blog/macos-clickfix-lures-deploy-applescript-stealer-persistent-rat";
+const PASTESWITCH_SOURCE: &str = "https://www.techiemike.com/clickfix-fake-captcha/";
+const HUNTIO_LINUX_SOURCE: &str =
+    "https://hunt.io/blog/apt36-clickfix-campaign-indian-ministry-of-defence";
+const PURPLESHIFT_SOURCE: &str = "https://purpleshift.io/articles/2026-08-24-clickfix/";
 
 const PAYLOADS: [PayloadCase; 25] = [
         PayloadCase {
@@ -282,10 +294,122 @@ const PAYLOADS: [PayloadCase; 25] = [
         },
 ];
 
-fn payloads() -> [PayloadCase; 25] {
+const CROSS_PLATFORM_PAYLOADS: [PayloadCase; 12] = [
+    PayloadCase {
+        id: "macos-blackcloak-l2j4-bash-curl",
+        payload_b64: include_str!("real_world_payloads/macos-blackcloak-l2j4-bash-curl.b64"),
+        publisher: "BlackCloak",
+        source_title: "Social Engineering Meets Shell Script Malware",
+        source_url: BLACKCLOAK_SOURCE,
+        completeness: PublicationCompleteness::Complete,
+    },
+    PayloadCase {
+        id: "macos-blackcloak-l2j4-update-chain",
+        payload_b64: include_str!("real_world_payloads/macos-blackcloak-l2j4-update-chain.b64"),
+        publisher: "BlackCloak",
+        source_title: "Social Engineering Meets Shell Script Malware",
+        source_url: BLACKCLOAK_SOURCE,
+        completeness: PublicationCompleteness::Complete,
+    },
+    PayloadCase {
+        id: "macos-recordedfuture-odyssey-base64",
+        payload_b64: include_str!("real_world_payloads/macos-recordedfuture-odyssey-base64.b64"),
+        publisher: "Recorded Future Insikt Group",
+        source_title: "ClickFix Campaigns Targeting Windows and macOS",
+        source_url: RECORDED_FUTURE_SOURCE,
+        completeness: PublicationCompleteness::Complete,
+    },
+    PayloadCase {
+        id: "macos-recordedfuture-odyssey-decoded",
+        payload_b64: include_str!("real_world_payloads/macos-recordedfuture-odyssey-decoded.b64"),
+        publisher: "Recorded Future Insikt Group",
+        source_title: "ClickFix Campaigns Targeting Windows and macOS",
+        source_url: RECORDED_FUTURE_SOURCE,
+        completeness: PublicationCompleteness::Complete,
+    },
+    PayloadCase {
+        id: "macos-recordedfuture-macsync-base64",
+        payload_b64: include_str!("real_world_payloads/macos-recordedfuture-macsync-base64.b64"),
+        publisher: "Recorded Future Insikt Group",
+        source_title: "ClickFix Campaigns Targeting Windows and macOS",
+        source_url: RECORDED_FUTURE_SOURCE,
+        completeness: PublicationCompleteness::Complete,
+    },
+    PayloadCase {
+        id: "macos-netskope-meow-osascript",
+        payload_b64: include_str!("real_world_payloads/macos-netskope-meow-osascript.b64"),
+        publisher: "Netskope Threat Labs",
+        source_title: "macOS ClickFix Lures Deploy AppleScript Stealer & Persistent RAT",
+        source_url: NETSKOPE_MACOS_SOURCE,
+        completeness: PublicationCompleteness::Complete,
+    },
+    PayloadCase {
+        id: "macos-netskope-meow-command-exec",
+        payload_b64: include_str!("real_world_payloads/macos-netskope-meow-command-exec.b64"),
+        publisher: "Netskope Threat Labs",
+        source_title: "macOS ClickFix Lures Deploy AppleScript Stealer & Persistent RAT",
+        source_url: NETSKOPE_MACOS_SOURCE,
+        completeness: PublicationCompleteness::Complete,
+    },
+    PayloadCase {
+        id: "macos-pasteswitch-export-zsh",
+        payload_b64: include_str!("real_world_payloads/macos-pasteswitch-export-zsh.b64"),
+        publisher: "Techie Mike / ADAMnetworks PasteSwitch",
+        source_title: "ClickFix: The Fake CAPTCHA That Tricks You Into Hacking Yourself",
+        source_url: PASTESWITCH_SOURCE,
+        completeness: PublicationCompleteness::Truncated,
+    },
+    PayloadCase {
+        id: "linux-huntio-apt36-mapeal-reconstructed",
+        payload_b64: include_str!(
+            "real_world_payloads/linux-huntio-apt36-mapeal-reconstructed.b64"
+        ),
+        publisher: "Hunt.io",
+        source_title:
+            "APT36-Style ClickFix Attack Spoofs Indian Ministry to Target Windows & Linux",
+        source_url: HUNTIO_LINUX_SOURCE,
+        completeness: PublicationCompleteness::Reconstructed,
+    },
+    PayloadCase {
+        id: "linux-purpleshift-curl-bash-representative",
+        payload_b64: include_str!(
+            "real_world_payloads/linux-purpleshift-curl-bash-representative.b64"
+        ),
+        publisher: "Purpleshift",
+        source_title: "Hack yourself: breaking down ClickFix",
+        source_url: PURPLESHIFT_SOURCE,
+        completeness: PublicationCompleteness::Representative,
+    },
+    PayloadCase {
+        id: "linux-purpleshift-wget-sh-representative",
+        payload_b64: include_str!(
+            "real_world_payloads/linux-purpleshift-wget-sh-representative.b64"
+        ),
+        publisher: "Purpleshift",
+        source_title: "Hack yourself: breaking down ClickFix",
+        source_url: PURPLESHIFT_SOURCE,
+        completeness: PublicationCompleteness::Representative,
+    },
+    PayloadCase {
+        id: "linux-purpleshift-download-chmod-representative",
+        payload_b64: include_str!(
+            "real_world_payloads/linux-purpleshift-download-chmod-representative.b64"
+        ),
+        publisher: "Purpleshift",
+        source_title: "Hack yourself: breaking down ClickFix",
+        source_url: PURPLESHIFT_SOURCE,
+        completeness: PublicationCompleteness::Representative,
+    },
+];
+
+fn payloads() -> Vec<PayloadCase> {
     PAYLOADS
+        .into_iter()
+        .chain(CROSS_PLATFORM_PAYLOADS)
+        .collect()
 }
 
+#[allow(clippy::too_many_lines)]
 fn fixture_sha256(id: &str) -> &'static str {
     match id {
         "proofpoint-ta571-darkgate-2024-05-28" => {
@@ -363,6 +487,42 @@ fn fixture_sha256(id: &str) -> &'static str {
         "dfir-interlock-trycloudflare" => {
             "781dae5dc89438bbc182adfd23c5eb7453cad8ba527a7ca472d22b6e072e20ef"
         }
+        "macos-blackcloak-l2j4-bash-curl" => {
+            "ae0741b014adedf7283e1e4b60a631534ee73c6ef84f7cb48e02a6e7c24e8251"
+        }
+        "macos-blackcloak-l2j4-update-chain" => {
+            "8c6e08e16ded542b482977a3f0e0dba8be9a776119b67f08a2aba10929a9a8a1"
+        }
+        "macos-recordedfuture-odyssey-base64" => {
+            "6edd1ea4af38ad09b0417789606ae8e2bc78d04f5eac093167bb599b33a5378b"
+        }
+        "macos-recordedfuture-odyssey-decoded" => {
+            "305f44084dda2a2bc3721ebe1e519f8d3bb5589ed4328513fb3b33448e57a1fd"
+        }
+        "macos-recordedfuture-macsync-base64" => {
+            "4037f59d7b048d9a832f731a26d8117bb5d830bd4c85455d6dff9a1954f342b2"
+        }
+        "macos-netskope-meow-osascript" => {
+            "7bbcbbc12673f5f678ead2b07959dd110b9c231e30a3eafbe7f1a34077eb90a3"
+        }
+        "macos-netskope-meow-command-exec" => {
+            "a424728d7f696814f8826e01761a4b5fd54d3d391c248a317984a6d4ab01496a"
+        }
+        "macos-pasteswitch-export-zsh" => {
+            "f18244bd5dc526b066f68c6bdf3ad7c374c32be592ff91d9bacc206f0c7c637a"
+        }
+        "linux-huntio-apt36-mapeal-reconstructed" => {
+            "612d374c864221bbbacb6cab829101cd2c32640d0550d2cb276699c14727c2f8"
+        }
+        "linux-purpleshift-curl-bash-representative" => {
+            "cfad3b8534be56fe127b35a664fb8e422fb8e79c0cb95440f22e0537b1e2e81f"
+        }
+        "linux-purpleshift-wget-sh-representative" => {
+            "769daf46b54a91083a717228bc4b2a2ed1afd87a5e12e800ca46aa56b97121db"
+        }
+        "linux-purpleshift-download-chmod-representative" => {
+            "de3bb09e5229e947d54005f7349744dc0d0446e9d7dd5233b0ddeb3bac6b8557"
+        }
         _ => panic!("missing fixture hash for {id}"),
     }
 }
@@ -377,7 +537,11 @@ fn decode_payload(case: &PayloadCase) -> String {
 }
 
 fn detector_input(case: &PayloadCase, payload: &str) -> DetectorInput {
-    if matches!(
+    if case.id.starts_with("macos-") {
+        DetectorInput::bash_script(payload)
+    } else if case.id.starts_with("linux-") {
+        DetectorInput::linux_shell_script(payload)
+    } else if matches!(
         case.id,
         "fortinet-pharmacynod-outfile-truncated" | "fortinet-pharmacynod-content"
     ) {
@@ -430,7 +594,10 @@ fn published_payloads_are_decoded_without_runtime_rewriting() {
         assert!(case.source_url.starts_with("https://"));
         assert!(matches!(
             case.completeness,
-            PublicationCompleteness::Complete | PublicationCompleteness::Truncated
+            PublicationCompleteness::Complete
+                | PublicationCompleteness::Truncated
+                | PublicationCompleteness::Reconstructed
+                | PublicationCompleteness::Representative
         ));
 
         let event_kinds = report
@@ -493,4 +660,62 @@ fn complete_payloads_produce_detection_evidence() {
         missing.is_empty(),
         "complete published payloads produced no detection evidence: {missing:?}"
     );
+}
+
+#[test]
+fn cross_platform_payloads_use_expected_hosts_and_behavioral_rules() {
+    for case in CROSS_PLATFORM_PAYLOADS {
+        let payload = decode_payload(&case);
+        let report = Detector::default()
+            .analyze(detector_input(&case, &payload))
+            .unwrap();
+
+        let expected_platform = if case.id.starts_with("macos-") {
+            HostPlatform::MacOs
+        } else {
+            HostPlatform::Linux
+        };
+        assert_eq!(report.host_platform, expected_platform, "{}", case.id);
+        assert!(!report.findings.is_empty(), "{}", case.id);
+    }
+
+    for (id, rule) in [
+        (
+            "macos-recordedfuture-odyssey-base64",
+            "shell.encoded-remote-command",
+        ),
+        (
+            "macos-recordedfuture-macsync-base64",
+            "shell.encoded-remote-command",
+        ),
+        (
+            "macos-netskope-meow-command-exec",
+            "chain.decode-write-execute",
+        ),
+        (
+            "linux-huntio-apt36-mapeal-reconstructed",
+            "chain.download-write-execute",
+        ),
+    ] {
+        let case = CROSS_PLATFORM_PAYLOADS
+            .iter()
+            .find(|case| case.id == id)
+            .expect("cross-platform fixture exists");
+        let payload = decode_payload(case);
+        let report = Detector::default()
+            .analyze(detector_input(case, &payload))
+            .unwrap();
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|finding| finding.rule_id == rule),
+            "{id} missing {rule}: {:?}",
+            report
+                .findings
+                .iter()
+                .map(|finding| finding.rule_id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
 }

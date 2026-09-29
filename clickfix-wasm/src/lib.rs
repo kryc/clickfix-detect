@@ -7,6 +7,8 @@ enum InputMode {
     Auto,
     Command,
     PowerShell,
+    Bash,
+    LinuxBash,
 }
 
 impl InputMode {
@@ -15,8 +17,10 @@ impl InputMode {
             "auto" => Ok(Self::Auto),
             "command" | "cmd" => Ok(Self::Command),
             "powershell" | "ps1" => Ok(Self::PowerShell),
+            "bash" | "sh" | "zsh" => Ok(Self::Bash),
+            "linux" | "linux-bash" => Ok(Self::LinuxBash),
             _ => Err(JsValue::from_str(
-                "input kind must be auto, command, or powershell",
+                "input kind must be auto, command, powershell, bash, or linux-bash",
             )),
         }
     }
@@ -58,11 +62,15 @@ fn analyze_payload_with_mode(
     let mode = InputMode::parse(input_kind)?;
     let kind = match mode {
         InputMode::PowerShell => InputKind::PowerShellScript,
+        InputMode::Bash => InputKind::BashScript,
+        InputMode::LinuxBash => InputKind::LinuxShellScript,
         InputMode::Command => InputKind::RawCommand,
         InputMode::Auto => Detector::infer_input_kind(payload),
     };
     let (kind_name, input) = match kind {
         InputKind::PowerShellScript => ("powershell", DetectorInput::powershell_script(payload)),
+        InputKind::BashScript => ("bash", DetectorInput::bash_script(payload)),
+        InputKind::LinuxShellScript => ("linux-bash", DetectorInput::linux_shell_script(payload)),
         InputKind::RawCommand => ("command", DetectorInput::raw_command(payload)),
     };
     let report = Detector::default()
@@ -98,7 +106,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn auto_mode_recognizes_powershell() {
+    fn auto_mode_recognizes_script_kinds() {
         assert_eq!(
             Detector::infer_input_kind("Invoke-WebRequest https://example.invalid"),
             InputKind::PowerShellScript
@@ -106,6 +114,10 @@ mod tests {
         assert_eq!(
             Detector::infer_input_kind("mshta https://example.invalid"),
             InputKind::RawCommand
+        );
+        assert_eq!(
+            Detector::infer_input_kind("name=world; echo \"$name\""),
+            InputKind::LinuxShellScript
         );
     }
 }

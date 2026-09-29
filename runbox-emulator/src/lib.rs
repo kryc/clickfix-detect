@@ -1,18 +1,22 @@
 mod archive_utilities;
 mod artifacts;
+mod bash;
 mod cmd;
 mod command_line;
 mod launcher_utilities;
+mod linux;
 mod lolbins;
+mod macos;
 mod powershell;
 mod process;
 mod scripts;
 mod system_utilities;
 
+use bash_emulator::BashError;
 use cmd_emulator::CmdError;
 use emulator_core::{
-    AnalysisLimits, Engine, EventKind, Host, HostError, HostSnapshot, NetworkPolicy, ProcessIntent,
-    TraceEvent, VirtualHost,
+    AnalysisLimits, Engine, EventKind, Host, HostError, HostPlatform, HostSnapshot, NetworkPolicy,
+    ProcessIntent, TraceEvent, VirtualHost,
 };
 use powershell_emulator::PowerShellError;
 use serde::{Deserialize, Serialize};
@@ -29,6 +33,8 @@ use command_line::{
 pub enum RunboxInput {
     RawCommand(String),
     PowerShellScript(String),
+    BashScript(String),
+    LinuxShellScript(String),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -44,6 +50,8 @@ pub enum RunboxError {
     PowerShell(#[from] PowerShellError),
     #[error(transparent)]
     Cmd(#[from] CmdError),
+    #[error(transparent)]
+    Bash(#[from] BashError),
     #[error(transparent)]
     WindowsScript(#[from] ScriptError),
 }
@@ -64,6 +72,20 @@ impl Runbox {
     pub fn new(limits: AnalysisLimits) -> Self {
         Self {
             host: VirtualHost::new(limits),
+        }
+    }
+
+    #[must_use]
+    pub fn new_macos(limits: AnalysisLimits) -> Self {
+        Self {
+            host: VirtualHost::macos(limits),
+        }
+    }
+
+    #[must_use]
+    pub fn new_linux(limits: AnalysisLimits) -> Self {
+        Self {
+            host: VirtualHost::linux(limits),
         }
     }
 
@@ -114,6 +136,30 @@ impl Runbox {
                 );
                 self.emulate_powershell(&script, 0)?;
             }
+            RunboxInput::BashScript(script) => {
+                self.host.emit(
+                    TraceEvent::new(
+                        0,
+                        Engine::Runbox,
+                        EventKind::Input,
+                        "received Bash script input",
+                    )
+                    .with_data("bytes", script.len().to_string()),
+                );
+                self.emulate_bash(&script, 0)?;
+            }
+            RunboxInput::LinuxShellScript(script) => {
+                self.host.emit(
+                    TraceEvent::new(
+                        0,
+                        Engine::Runbox,
+                        EventKind::Input,
+                        "received Linux shell script input",
+                    )
+                    .with_data("bytes", script.len().to_string()),
+                );
+                self.emulate_bash(&script, 0)?;
+            }
         }
         self.drain_process_intents()?;
         Ok(RunboxResult {
@@ -132,6 +178,7 @@ impl Runbox {
                     match error {
                         RunboxError::Host(error)
                         | RunboxError::Cmd(CmdError::Host(error))
+                        | RunboxError::Bash(BashError::Host(error))
                         | RunboxError::PowerShell(PowerShellError::Host(error))
                         | RunboxError::WindowsScript(ScriptError::Host(error)) => {
                             return Err(error.into());
@@ -176,6 +223,7 @@ impl Runbox {
         self.dispatch_process(&intent)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn dispatch_process(&mut self, intent: &ProcessIntent) -> Result<(), RunboxError> {
         self.host
             .consume_step(Engine::Runbox, intent.depth, "dispatching virtual process")?;
@@ -196,12 +244,24 @@ impl Runbox {
         if self.dispatch_lolbin_utility(&program, intent) {
             return Ok(());
         }
+        match self.host.platform() {
+            HostPlatform::MacOs if self.dispatch_macos_utility(&program, intent)? => {
+                return Ok(());
+            }
+            HostPlatform::Linux if self.dispatch_linux_utility(&program, intent)? => {
+                return Ok(());
+            }
+            HostPlatform::Windows | HostPlatform::MacOs | HostPlatform::Linux => {}
+        }
 
         match program.as_str() {
             "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" => {
                 self.dispatch_powershell_arguments(&intent.args, intent.depth)
             }
             "cmd" | "cmd.exe" => self.emulate_cmd(&intent.args, intent.depth),
+            "bash" | "sh" | "zsh" => {
+                self.dispatch_bash_arguments(&program, &intent.args, &intent.stdin, intent.depth)
+            }
             "mshta" | "mshta.exe" => self.emulate_mshta(&intent.args, intent.depth),
             "wscript" | "wscript.exe" | "cscript" | "cscript.exe" => {
                 self.emulate_wscript(&program, &intent.args, intent.depth)

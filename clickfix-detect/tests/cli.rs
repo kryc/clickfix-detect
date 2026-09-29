@@ -170,3 +170,50 @@ fn thorough_mode_bypasses_the_hot_path_skip() {
     assert_eq!(thorough_report["analysis_status"], "emulated");
     assert!(thorough_report["input"]["sha256"].is_string());
 }
+
+#[test]
+fn bash_kind_runs_on_the_macos_emulation_path() {
+    let output = detector_command()
+        .args([
+            "--kind",
+            "bash",
+            "--format",
+            "json",
+            "echo safe > /tmp/result.txt; cat /tmp/result.txt",
+        ])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(report["input"]["kind"], "bash_script");
+    assert!(report["virtual_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| { file["path"] == "/tmp/result.txt" && file["text"] == "safe\n" }));
+}
+
+#[test]
+fn linux_bash_kind_runs_on_the_linux_emulation_path() {
+    let output = detector_command()
+        .args([
+            "--kind",
+            "linux-bash",
+            "--format",
+            "json",
+            "echo safe > /tmp/result.txt; uname -a",
+        ])
+        .output()
+        .unwrap();
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+    assert!(output.status.success());
+    assert_eq!(report["host_platform"], "linux");
+    assert_eq!(report["input"]["kind"], "linux_shell_script");
+    assert!(report["virtual_files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|file| { file["path"] == "/tmp/result.txt" && file["text"] == "safe\n" }));
+}

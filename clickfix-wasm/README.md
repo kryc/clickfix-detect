@@ -17,9 +17,9 @@ const { input_kind, report } = analyze_payload(
 );
 ```
 
-Accepted input kinds are `auto`, `command`, and `powershell`. The returned
-value is a JavaScript object containing the inferred input kind and the complete
-serialized `AnalysisReport`.
+Accepted input kinds are `auto`, `command`, `powershell`, `bash`, and
+`linux-bash`. The returned value is a JavaScript object containing the inferred
+input kind and the complete serialized `AnalysisReport`.
 
 `prefilter_payload` is intended for clipboard hot paths. Call
 `analyze_payload` only when its decision is `candidate`; `definitely_benign`

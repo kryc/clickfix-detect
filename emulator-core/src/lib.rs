@@ -52,11 +52,26 @@ pub enum Engine {
     Runbox,
     PowerShell,
     Cmd,
+    Bash,
     Mshta,
     Wscript,
     Rundll32,
     Regsvr32,
     ShellAssociation,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HostPlatform {
+    Windows,
+    MacOs,
+    Linux,
+}
+
+impl Default for HostPlatform {
+    fn default() -> Self {
+        Self::Windows
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -74,6 +89,7 @@ pub enum EventKind {
     FileDelete,
     RegistryRead,
     RegistryWrite,
+    Persistence,
     Output,
     Artifact,
     Unsupported,
@@ -284,6 +300,8 @@ enum RetentionLimit {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostSnapshot {
+    #[serde(default)]
+    pub platform: HostPlatform,
     pub trace: Vec<TraceEvent>,
     pub iocs: Vec<Ioc>,
     pub artifacts: Vec<Artifact>,
@@ -431,6 +449,7 @@ pub trait Host {
 
 #[derive(Debug, Clone)]
 pub struct VirtualHost {
+    platform: HostPlatform,
     limits: AnalysisLimits,
     trace: Vec<TraceEvent>,
     iocs: Vec<Ioc>,
@@ -455,16 +474,45 @@ pub struct VirtualHost {
 impl VirtualHost {
     #[must_use]
     pub fn new(limits: AnalysisLimits) -> Self {
-        let environment = Self::windows_11_environment();
-        let directories = Self::windows_11_directories()
+        Self::with_platform(limits, HostPlatform::Windows)
+    }
+
+    #[must_use]
+    pub fn macos(limits: AnalysisLimits) -> Self {
+        Self::with_platform(limits, HostPlatform::MacOs)
+    }
+
+    #[must_use]
+    pub fn linux(limits: AnalysisLimits) -> Self {
+        Self::with_platform(limits, HostPlatform::Linux)
+    }
+
+    #[must_use]
+    pub fn with_platform(limits: AnalysisLimits, platform: HostPlatform) -> Self {
+        let environment = match platform {
+            HostPlatform::Windows => Self::windows_11_environment(),
+            HostPlatform::MacOs => Self::macos_environment(),
+            HostPlatform::Linux => Self::linux_environment(),
+        };
+        let directory_paths = match platform {
+            HostPlatform::Windows => Self::windows_11_directories(),
+            HostPlatform::MacOs => Self::macos_directories(),
+            HostPlatform::Linux => Self::linux_directories(),
+        };
+        let executable_paths = match platform {
+            HostPlatform::Windows => Self::windows_11_executables(),
+            HostPlatform::MacOs => Self::macos_executables(),
+            HostPlatform::Linux => Self::linux_executables(),
+        };
+        let directories = directory_paths
             .into_iter()
-            .map(|path| (normalize_windows_path(path), true))
+            .map(|path| (normalize_path_for(platform, path), true))
             .collect();
-        let files = Self::windows_11_executables()
+        let mut files: BTreeMap<String, VirtualFile> = executable_paths
             .into_iter()
             .map(|path| {
                 (
-                    normalize_windows_path(path),
+                    normalize_path_for(platform, path),
                     VirtualFile {
                         bytes: Vec::new(),
                         truncated: false,
@@ -474,8 +522,22 @@ impl VirtualHost {
                 )
             })
             .collect();
+        if platform == HostPlatform::Linux {
+            for (path, bytes) in Self::linux_baseline_files() {
+                files.insert(
+                    normalize_posix_path(path),
+                    VirtualFile {
+                        bytes: bytes.as_bytes().to_vec(),
+                        truncated: false,
+                        executable: false,
+                        baseline: true,
+                    },
+                );
+            }
+        }
 
         Self {
+            platform,
             limits,
             trace: Vec::new(),
             iocs: Vec::new(),
@@ -496,6 +558,11 @@ impl VirtualHost {
             child_processes: 0,
             retention_limits_reached: BTreeSet::new(),
         }
+    }
+
+    #[must_use]
+    pub const fn platform(&self) -> HostPlatform {
+        self.platform
     }
 
     #[must_use]
@@ -650,6 +717,270 @@ impl VirtualHost {
             .collect()
     }
 
+    #[must_use]
+    pub fn macos_directories() -> Vec<&'static str> {
+        vec![
+            "/",
+            "/Applications",
+            "/Library",
+            "/Library/LaunchAgents",
+            "/Library/LaunchDaemons",
+            "/System",
+            "/System/Library",
+            "/Users",
+            "/Users/analysis",
+            "/Users/analysis/Desktop",
+            "/Users/analysis/Documents",
+            "/Users/analysis/Downloads",
+            "/Users/analysis/Library",
+            "/Users/analysis/Library/Application Support",
+            "/Users/analysis/Library/Caches",
+            "/Users/analysis/Library/LaunchAgents",
+            "/Users/analysis/Library/Preferences",
+            "/bin",
+            "/private",
+            "/private/tmp",
+            "/tmp",
+            "/usr",
+            "/usr/bin",
+            "/usr/local",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/var",
+            "/var/tmp",
+        ]
+    }
+
+    #[must_use]
+    pub fn macos_executables() -> Vec<&'static str> {
+        vec![
+            "/bin/bash",
+            "/bin/cat",
+            "/bin/chmod",
+            "/bin/cp",
+            "/bin/date",
+            "/bin/echo",
+            "/bin/kill",
+            "/bin/launchctl",
+            "/bin/ls",
+            "/bin/mkdir",
+            "/bin/mv",
+            "/bin/pwd",
+            "/bin/rm",
+            "/bin/sh",
+            "/bin/sleep",
+            "/bin/test",
+            "/bin/zsh",
+            "/usr/bin/awk",
+            "/usr/bin/base64",
+            "/usr/bin/curl",
+            "/usr/bin/defaults",
+            "/usr/bin/dscl",
+            "/usr/bin/env",
+            "/usr/bin/find",
+            "/usr/bin/grep",
+            "/usr/bin/head",
+            "/usr/bin/nohup",
+            "/usr/bin/open",
+            "/usr/bin/osascript",
+            "/usr/bin/perl",
+            "/usr/bin/python3",
+            "/usr/bin/sed",
+            "/usr/bin/sort",
+            "/usr/bin/sudo",
+            "/usr/bin/tail",
+            "/usr/bin/tar",
+            "/usr/bin/tee",
+            "/usr/bin/uname",
+            "/usr/bin/wc",
+            "/usr/bin/xattr",
+            "/usr/bin/security",
+            "/usr/bin/setsid",
+            "/usr/bin/timeout",
+            "/usr/sbin/scutil",
+        ]
+    }
+
+    #[must_use]
+    pub fn macos_environment() -> BTreeMap<String, String> {
+        [
+            ("HOME", "/Users/analysis"),
+            ("LOGNAME", "analysis"),
+            ("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"),
+            ("PWD", "/Users/analysis"),
+            ("SHELL", "/bin/zsh"),
+            ("SHLVL", "1"),
+            ("TMPDIR", "/private/tmp"),
+            ("USER", "analysis"),
+            ("LANG", "en_US.UTF-8"),
+            ("LC_ALL", "en_US.UTF-8"),
+            ("HOSTNAME", "analysis-mac"),
+            ("TERM", "xterm-256color"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect()
+    }
+
+    #[must_use]
+    pub fn linux_directories() -> Vec<&'static str> {
+        vec![
+            "/",
+            "/bin",
+            "/boot",
+            "/dev",
+            "/dev/shm",
+            "/etc",
+            "/etc/cron.d",
+            "/etc/cron.daily",
+            "/etc/init.d",
+            "/etc/systemd",
+            "/etc/systemd/system",
+            "/home",
+            "/home/analysis",
+            "/home/analysis/.cache",
+            "/home/analysis/.config",
+            "/home/analysis/.config/autostart",
+            "/home/analysis/.config/systemd",
+            "/home/analysis/.config/systemd/user",
+            "/home/analysis/.local",
+            "/home/analysis/.local/bin",
+            "/home/analysis/Downloads",
+            "/lib",
+            "/lib/systemd",
+            "/lib/systemd/system",
+            "/opt",
+            "/proc",
+            "/root",
+            "/run",
+            "/sbin",
+            "/srv",
+            "/sys",
+            "/tmp",
+            "/usr",
+            "/usr/bin",
+            "/usr/local",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/var",
+            "/var/lib",
+            "/var/log",
+            "/var/spool",
+            "/var/spool/cron",
+            "/var/tmp",
+        ]
+    }
+
+    #[must_use]
+    pub fn linux_executables() -> Vec<&'static str> {
+        vec![
+            "/bin/bash",
+            "/bin/cat",
+            "/bin/chmod",
+            "/bin/chown",
+            "/bin/cp",
+            "/bin/date",
+            "/bin/echo",
+            "/bin/kill",
+            "/bin/ls",
+            "/bin/mkdir",
+            "/bin/mv",
+            "/bin/pwd",
+            "/bin/rm",
+            "/bin/sh",
+            "/bin/sleep",
+            "/bin/systemctl",
+            "/bin/tar",
+            "/bin/test",
+            "/bin/zsh",
+            "/usr/bin/apt",
+            "/usr/bin/apt-get",
+            "/usr/bin/awk",
+            "/usr/bin/base64",
+            "/usr/bin/crontab",
+            "/usr/bin/curl",
+            "/usr/bin/dnf",
+            "/usr/bin/dpkg",
+            "/usr/bin/env",
+            "/usr/bin/find",
+            "/usr/bin/grep",
+            "/usr/bin/head",
+            "/usr/bin/id",
+            "/usr/bin/nc",
+            "/usr/bin/nohup",
+            "/usr/bin/perl",
+            "/usr/bin/python",
+            "/usr/bin/python3",
+            "/usr/bin/rpm",
+            "/usr/bin/sed",
+            "/usr/bin/setsid",
+            "/usr/bin/sort",
+            "/usr/bin/ssh",
+            "/usr/bin/sudo",
+            "/usr/bin/systemctl",
+            "/usr/bin/tail",
+            "/usr/bin/tee",
+            "/usr/bin/timeout",
+            "/usr/bin/uname",
+            "/usr/bin/unzip",
+            "/usr/bin/wc",
+            "/usr/bin/wget",
+            "/usr/bin/whoami",
+            "/usr/bin/yum",
+            "/usr/sbin/chroot",
+            "/usr/sbin/iptables",
+            "/usr/sbin/nft",
+            "/usr/sbin/service",
+            "/usr/sbin/ufw",
+        ]
+    }
+
+    #[must_use]
+    pub fn linux_environment() -> BTreeMap<String, String> {
+        [
+            ("HOME", "/home/analysis"),
+            ("HOSTNAME", "analysis-linux"),
+            ("LANG", "en_US.UTF-8"),
+            ("LC_ALL", "en_US.UTF-8"),
+            ("LOGNAME", "analysis"),
+            (
+                "PATH",
+                "/usr/local/bin:/usr/bin:/bin:/usr/local/sbin:/usr/sbin:/sbin",
+            ),
+            ("PWD", "/home/analysis"),
+            ("SHELL", "/bin/bash"),
+            ("SHLVL", "1"),
+            ("TERM", "xterm-256color"),
+            ("TMPDIR", "/tmp"),
+            ("USER", "analysis"),
+        ]
+        .into_iter()
+        .map(|(name, value)| (name.into(), value.into()))
+        .collect()
+    }
+
+    #[must_use]
+    pub fn linux_baseline_files() -> Vec<(&'static str, &'static str)> {
+        vec![
+            (
+                "/etc/os-release",
+                "NAME=\"Analysis Linux\"\nID=analysis\nVERSION_ID=\"1\"\nPRETTY_NAME=\"Analysis Linux 1\"\n",
+            ),
+            (
+                "/etc/passwd",
+                "root:x:0:0:root:/root:/bin/bash\nanalysis:x:1000:1000:Analysis User:/home/analysis:/bin/bash\n",
+            ),
+            (
+                "/etc/hosts",
+                "127.0.0.1 localhost\n127.0.1.1 analysis-linux\n::1 localhost ip6-localhost\n",
+            ),
+            (
+                "/proc/version",
+                "Linux version 6.8.0-analysis (analysis@analysis-linux) #1 SMP x86_64 GNU/Linux\n",
+            ),
+        ]
+    }
+
     pub fn take_process_intents(&mut self) -> Vec<ProcessIntent> {
         self.process_intents.drain(..).collect()
     }
@@ -724,6 +1055,24 @@ impl VirtualHost {
         &self.network_policy
     }
 
+    fn normalize_path(&self, path: &str) -> String {
+        normalize_path_for(self.platform, path)
+    }
+
+    fn environment_name(&self, name: &str) -> String {
+        match self.platform {
+            HostPlatform::Windows => name.to_ascii_lowercase(),
+            HostPlatform::MacOs | HostPlatform::Linux => name.into(),
+        }
+    }
+
+    const fn path_separator(&self) -> char {
+        match self.platform {
+            HostPlatform::Windows => '\\',
+            HostPlatform::MacOs | HostPlatform::Linux => '/',
+        }
+    }
+
     /// Add or replace a file in the virtual filesystem.
     ///
     /// # Errors
@@ -766,7 +1115,7 @@ impl VirtualHost {
     #[must_use]
     pub fn virtual_file(&self, path: &str) -> Option<&[u8]> {
         self.files
-            .get(&normalize_windows_path(path))
+            .get(&self.normalize_path(path))
             .map(|file| file.bytes.as_slice())
     }
 
@@ -840,6 +1189,7 @@ impl VirtualHost {
             .collect();
 
         HostSnapshot {
+            platform: self.platform,
             trace: self.trace.clone(),
             iocs: self.iocs.clone(),
             artifacts: self.artifacts.clone(),
@@ -880,9 +1230,21 @@ impl VirtualHost {
     }
 
     fn ensure_parent_directories(&mut self, path: &str) {
-        let Some((parent, _)) = path.rsplit_once('\\') else {
+        let separator = self.path_separator();
+        let Some((parent, _)) = path.rsplit_once(separator) else {
             return;
         };
+        if matches!(self.platform, HostPlatform::MacOs | HostPlatform::Linux) {
+            let mut current = String::from("/");
+            for part in parent.split('/').filter(|part| !part.is_empty()) {
+                if current.len() > 1 {
+                    current.push('/');
+                }
+                current.push_str(part);
+                self.directories.entry(current.clone()).or_insert(false);
+            }
+            return;
+        }
         let mut current = String::new();
         for (index, part) in parent.split('\\').enumerate() {
             if index == 0 {
@@ -1152,7 +1514,7 @@ impl Host for VirtualHost {
         engine: Engine,
         depth: usize,
     ) -> Result<(), HostError> {
-        let normalized = normalize_windows_path(path);
+        let normalized = self.normalize_path(path);
         self.ensure_parent_directories(&normalized);
         let consumes_slot = self.files.get(&normalized).is_none_or(|file| file.baseline);
         if consumes_slot
@@ -1234,7 +1596,7 @@ impl Host for VirtualHost {
     }
 
     fn read_file(&mut self, path: &str, engine: Engine, depth: usize) -> Option<Vec<u8>> {
-        let normalized = normalize_windows_path(path);
+        let normalized = self.normalize_path(path);
         let bytes = self.files.get(&normalized).map(|file| file.bytes.clone());
         self.emit(
             TraceEvent::new(
@@ -1249,7 +1611,7 @@ impl Host for VirtualHost {
     }
 
     fn delete_file(&mut self, path: &str, engine: Engine, depth: usize) -> bool {
-        let normalized = normalize_windows_path(path);
+        let normalized = self.normalize_path(path);
         let removed = self.files.remove(&normalized).is_some();
         self.emit(
             TraceEvent::new(
@@ -1264,7 +1626,7 @@ impl Host for VirtualHost {
     }
 
     fn list_files(&mut self, prefix: &str, engine: Engine, depth: usize) -> Vec<String> {
-        let normalized = normalize_windows_path(prefix);
+        let normalized = self.normalize_path(prefix);
         let files = self
             .files
             .keys()
@@ -1289,7 +1651,7 @@ impl Host for VirtualHost {
         engine: Engine,
         depth: usize,
     ) -> Result<(), HostError> {
-        let normalized = normalize_windows_path(path);
+        let normalized = self.normalize_path(path);
         self.ensure_parent_directories(&normalized);
         self.directories.entry(normalized.clone()).or_insert(false);
         self.emit(
@@ -1306,11 +1668,11 @@ impl Host for VirtualHost {
     }
 
     fn directory_exists(&self, path: &str) -> bool {
-        self.directories.contains_key(&normalize_windows_path(path))
+        self.directories.contains_key(&self.normalize_path(path))
     }
 
     fn list_directories(&mut self, prefix: &str, engine: Engine, depth: usize) -> Vec<String> {
-        let normalized = normalize_windows_path(prefix);
+        let normalized = self.normalize_path(prefix);
         let directories = self
             .directories
             .keys()
@@ -1337,8 +1699,9 @@ impl Host for VirtualHost {
         engine: Engine,
         depth: usize,
     ) -> bool {
-        let normalized = normalize_windows_path(path);
-        let prefix = format!("{}\\", normalized.trim_end_matches('\\'));
+        let normalized = self.normalize_path(path);
+        let separator = self.path_separator();
+        let prefix = format!("{}{separator}", normalized.trim_end_matches(separator));
         let has_children = self
             .directories
             .keys()
@@ -1376,7 +1739,7 @@ impl Host for VirtualHost {
         engine: Engine,
         depth: usize,
     ) -> Result<(), HostError> {
-        let normalized = normalize_windows_path(path);
+        let normalized = self.normalize_path(path);
         self.ensure_parent_directories(&normalized);
         let consumes_slot = self.files.get(&normalized).is_none_or(|file| file.baseline);
         if consumes_slot
@@ -1409,18 +1772,18 @@ impl Host for VirtualHost {
 
     fn is_executable(&self, path: &str) -> bool {
         self.files
-            .get(&normalize_windows_path(path))
+            .get(&self.normalize_path(path))
             .is_some_and(|file| file.executable)
     }
 
     fn set_environment(&mut self, name: &str, value: &str) {
         self.environment
-            .insert(name.to_ascii_lowercase(), value.into());
+            .insert(self.environment_name(name), value.into());
     }
 
     fn environment(&self, name: &str) -> Option<&str> {
         self.environment
-            .get(&name.to_ascii_lowercase())
+            .get(&self.environment_name(name))
             .map(String::as_str)
     }
 
@@ -1433,7 +1796,7 @@ impl Host for VirtualHost {
 
     fn remove_environment(&mut self, name: &str) -> bool {
         self.environment
-            .remove(&name.to_ascii_lowercase())
+            .remove(&self.environment_name(name))
             .is_some()
     }
 
@@ -1664,6 +2027,41 @@ impl Host for VirtualHost {
 }
 
 #[must_use]
+pub fn normalize_path_for(platform: HostPlatform, path: &str) -> String {
+    match platform {
+        HostPlatform::Windows => normalize_windows_path(path),
+        HostPlatform::MacOs | HostPlatform::Linux => normalize_posix_path(path),
+    }
+}
+
+#[must_use]
+pub fn normalize_posix_path(path: &str) -> String {
+    let path = path.trim().trim_matches('"').replace('\\', "/");
+    let absolute = path.starts_with('/');
+    let mut parts = Vec::new();
+    for part in path.split('/') {
+        match part {
+            "" | "." => {}
+            ".." => {
+                parts.pop();
+            }
+            _ => parts.push(part),
+        }
+    }
+    if absolute {
+        if parts.is_empty() {
+            "/".into()
+        } else {
+            format!("/{}", parts.join("/"))
+        }
+    } else if parts.is_empty() {
+        ".".into()
+    } else {
+        parts.join("/")
+    }
+}
+
+#[must_use]
 pub fn normalize_windows_path(path: &str) -> String {
     let mut normalized = path.trim().trim_matches('"').replace('/', "\\");
     while normalized.contains("\\\\") {
@@ -1794,6 +2192,46 @@ mod tests {
         assert!(host.is_executable(r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"));
         assert!(host.snapshot().virtual_files.is_empty());
         assert!(host.snapshot().virtual_directories.is_empty());
+    }
+
+    #[test]
+    fn virtual_host_supports_macos_paths_and_case_sensitive_environment() {
+        let mut host = VirtualHost::macos(AnalysisLimits::default());
+
+        assert_eq!(host.platform(), HostPlatform::MacOs);
+        assert_eq!(host.environment("HOME"), Some("/Users/analysis"));
+        assert_eq!(host.environment("home"), None);
+        assert!(host.directory_exists("/Users/analysis/Downloads"));
+        assert!(host.is_executable("/bin/bash"));
+        host.add_virtual_file("/Users/analysis/Test.sh", b"echo safe")
+            .unwrap();
+        assert_eq!(
+            host.virtual_file("/Users/analysis/Test.sh"),
+            Some(&b"echo safe"[..])
+        );
+        assert!(host.virtual_file("/users/analysis/test.sh").is_none());
+    }
+
+    #[test]
+    fn virtual_host_supports_linux_paths_environment_and_executables() {
+        let mut host = VirtualHost::linux(AnalysisLimits::default());
+
+        assert_eq!(host.platform(), HostPlatform::Linux);
+        assert_eq!(host.environment("HOME"), Some("/home/analysis"));
+        assert_eq!(host.environment("home"), None);
+        assert!(host.directory_exists("/etc/systemd/system"));
+        assert!(host.directory_exists("/home/analysis/.config/systemd/user"));
+        assert!(host.is_executable("/bin/bash"));
+        assert!(host.is_executable("/usr/bin/systemctl"));
+        assert!(host
+            .virtual_file("/etc/os-release")
+            .is_some_and(|bytes| bytes.starts_with(b"NAME=\"Analysis Linux\"")));
+        host.add_virtual_file("/etc/systemd/system/example.service", b"[Service]\n")
+            .unwrap();
+        assert_eq!(
+            host.virtual_file("/etc/systemd/system/example.service"),
+            Some(&b"[Service]\n"[..])
+        );
     }
 
     #[test]

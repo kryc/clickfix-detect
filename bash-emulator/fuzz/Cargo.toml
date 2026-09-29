@@ -1,0 +1,30 @@
+[package]
+name = "bash-emulator-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+bash-emulator = { path = ".." }
+emulator-core = { path = "../../emulator-core" }
+libfuzzer-sys = "0.4.10"
+
+[[bin]]
+name = "tokenizer"
+path = "fuzz_targets/tokenizer.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "emulator"
+path = "fuzz_targets/emulator.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]
