@@ -1,8 +1,8 @@
 use super::{
     bytes_to_value, decode_candidate, extract_delimited, quote_argument, sha256_hex,
     split_windows_command_line, unescape_powershell, ArtifactKind, Engine, EventKind, Host,
-    PowerShellEmulator, PowerShellError, ProcessIntent, StringKind, TokenKind, TraceEvent, Value,
-    VARIABLE_RE,
+    PowerShellEmulator, PowerShellError, ProcessIntent, ProcessResult, StringKind, TokenKind,
+    TraceEvent, Value, VARIABLE_RE,
 };
 use crate::parser::ParsedSource;
 use crate::tokenizer::{is_double_quote, is_single_quote};
@@ -242,6 +242,28 @@ impl PowerShellEmulator {
             current_directory: String::new(),
         })?;
         Ok(())
+    }
+
+    pub(crate) fn request_process(
+        program: &str,
+        args: Vec<String>,
+        origin: &str,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<Option<ProcessResult>, PowerShellError> {
+        let command_line = std::iter::once(program.to_owned())
+            .chain(args.iter().map(|argument| quote_argument(argument)))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(host.process_request(ProcessIntent {
+            program: program.into(),
+            args,
+            command_line,
+            origin: origin.into(),
+            depth: depth + 1,
+            stdin: Vec::new(),
+            current_directory: String::new(),
+        })?)
     }
 }
 

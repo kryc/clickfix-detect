@@ -585,10 +585,12 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "bash-emulator",
+ "clap",
  "cmd-emulator",
  "emulator-core",
  "powershell-emulator",
  "regex",
+ "rustyline",
  "serde",
  "thiserror",
  "windows-script-emulator",

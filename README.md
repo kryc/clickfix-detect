@@ -14,7 +14,7 @@ an explicit bounded public-HTTP(S) opt-in.
 | `bash-emulator` | Standalone, tokenized and AST-driven Bash emulation on deterministic virtual macOS and Linux hosts |
 | `powershell-emulator` | Span-preserving PowerShell parsing and bounded hermetic interpretation |
 | `windows-script-emulator` | Bounded JScript/VBScript interpreter for WScript, CScript, HTA, scriptlet, and COM behavior |
-| `runbox-emulator` | Windows command dispatch, virtual process recursion, and launcher modeling |
+| `runbox-emulator` | Windows command dispatch, virtual process recursion, launcher modeling, and a cross-emulator interactive shell |
 | `clickfix-detect` | Weighted detection rules, Rust API, human/JSON reports, and the CLI |
 | `clickfix-wasm` | Browser-safe wasm-bindgen wrapper around `clickfix-detect` |
 
@@ -249,6 +249,38 @@ C:\Users\analysis> type test.txt
 
 Cmd does not treat single quotes as quoting characters, so they are retained
 in the file contents.
+
+For an interactive cmd prompt that recursively dispatches PowerShell and the
+other Runbox application models, use the Runbox-backed shell:
+
+```console
+cargo run -p runbox-emulator
+C:\Users\analysis> powershell -c "Write-Output 'hello'"
+hello
+C:\Users\analysis> powershell -c "Set-Content shared.txt 'from PowerShell'"
+C:\Users\analysis> type shared.txt
+from PowerShell
+```
+
+The cmd runtime remains persistent between entries, while every PowerShell
+launch receives a new PowerShell process state and shares the same virtual
+environment, filesystem, registry, network fixtures, limits, and trace. Use
+`--interactive` for piped commands, `--trace` for typed effects,
+`--delayed-expansion` for `!VAR!`, and `--allow-network` only when bounded real
+HTTP(S) retrieval is explicitly required.
+
+The same shell works in the opposite direction with a persistent PowerShell
+parent process:
+
+```console
+cargo run -p runbox-emulator -- --shell powershell
+PS> $env:SHARED = 'from PowerShell'
+PS> cmd /c echo %SHARED%
+from PowerShell
+PS> cmd /c "echo from cmd>shared.txt"
+PS> Get-Content shared.txt
+from cmd
+```
 
 The Bash emulator provides the matching macOS-oriented shell boundary:
 

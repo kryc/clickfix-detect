@@ -483,8 +483,25 @@ impl PowerShellEmulator {
                         );
                     }
                 }
-                Self::spawn(&command, args, "PowerShell command", host, depth)?;
-                Ok(Some(Value::Object("BlockedProcess".into())))
+                match Self::request_process(&command, args, "PowerShell command", host, depth)? {
+                    Some(result) => {
+                        self.variables.insert(
+                            "lastexitcode".into(),
+                            Value::Number(i64::from(result.exit_code)),
+                        );
+                        self.variables
+                            .insert("?".into(), Value::Bool(result.exit_code == 0));
+                        self.error_output.extend(result.stderr);
+                        Ok(Some(match result.stdout.as_slice() {
+                            [] => Value::Null,
+                            [line] => Value::String(line.clone()),
+                            lines => {
+                                Value::Array(lines.iter().cloned().map(Value::String).collect())
+                            }
+                        }))
+                    }
+                    None => Ok(Some(Value::Object("BlockedProcess".into()))),
+                }
             }
             _ if self.functions.contains_key(&command) => {
                 if let Some(function) = self.functions.get(&command).cloned() {

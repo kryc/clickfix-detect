@@ -16,5 +16,9 @@ thiserror.workspace = true
 windows-script-emulator = { path = "../windows-script-emulator" }
 zip.workspace = true
 
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+clap.workspace = true
+rustyline.workspace = true
+
 [lints]
 workspace = true

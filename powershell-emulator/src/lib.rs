@@ -28,7 +28,7 @@ pub mod tokenizer;
 
 use emulator_core::{
     sha256_hex, ArtifactKind, Engine, EventKind, Host, HostError, NetworkIntent, NetworkRequest,
-    ProcessIntent, TraceEvent,
+    ProcessIntent, ProcessResult, TraceEvent,
 };
 use parser::ParsedSource;
 use regex::Regex;

@@ -98,6 +98,16 @@ impl Runbox {
         &mut self.host
     }
 
+    /// Dispatch process intents queued by nested emulator activity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a queued child emulator reaches a host resource
+    /// limit or cannot complete its modeled execution.
+    pub fn drain_pending_processes(&mut self) -> Result<(), RunboxError> {
+        self.drain_process_intents()
+    }
+
     #[must_use]
     pub fn with_network_policy(mut self, policy: NetworkPolicy) -> Self {
         self.host.set_network_policy(policy);
