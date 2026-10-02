@@ -1,12 +1,18 @@
 use crate::runtime::FlowControl;
 use crate::{BashEmulator, BashError, CommandOutput};
-use emulator_core::{Engine, EventKind, Host, TraceEvent};
+use base64::Engine as _;
+use emulator_core::{
+    ArtifactKind, CausalEdge, CausalEntity, CausalRelation, Engine, EventKind, Host, TraceEvent,
+};
+use std::collections::BTreeMap;
 
+#[allow(clippy::too_many_lines)]
 pub(crate) fn execute(
     emulator: &mut BashEmulator,
     name: &str,
     arguments: &[String],
     input: &[String],
+    input_causes: &[CausalEntity],
     host: &mut dyn Host,
     depth: usize,
 ) -> Result<Option<CommandOutput>, BashError> {
@@ -55,7 +61,9 @@ pub(crate) fn execute(
         "rmdir" => rmdir(emulator, arguments, host, depth),
         "rm" => rm(emulator, arguments, host, depth),
         "touch" => touch(emulator, arguments, host, depth)?,
-        "cat" => cat(emulator, arguments, input, host, depth),
+        "cat" => cat(emulator, arguments, input, input_causes, host, depth),
+        "base64" => base64_command(emulator, arguments, input, input_causes, host, depth),
+        "ls" => ls(emulator, arguments, host, depth),
         "cp" => copy(emulator, arguments, host, depth)?,
         "mv" => move_file(emulator, arguments, host, depth)?,
         "chmod" => chmod(emulator, arguments, host, depth)?,
@@ -65,7 +73,7 @@ pub(crate) fn execute(
         "sort" => sort(input),
         "uniq" => uniq(input),
         "wc" => wc(arguments, input),
-        "tee" => tee(emulator, arguments, input, host, depth)?,
+        "tee" => tee(emulator, arguments, input, input_causes, host, depth)?,
         "env" => env(emulator, arguments, host, depth)?,
         "local" | "declare" | "typeset" | "readonly" => {
             assign_shell_variables(emulator, arguments, host, depth)
@@ -74,17 +82,41 @@ pub(crate) fn execute(
             let Some((nested, arguments)) = arguments.split_first() else {
                 return Ok(Some(success()));
             };
-            if let Some(output) = execute(emulator, nested, arguments, input, host, depth)? {
+            if let Some(output) = execute(
+                emulator,
+                nested,
+                arguments,
+                input,
+                input_causes,
+                host,
+                depth,
+            )? {
                 return Ok(Some(output));
             }
             return emulator
-                .execute_external(nested, arguments, input.to_vec(), host, depth)
+                .execute_external(
+                    nested,
+                    arguments,
+                    input.to_vec(),
+                    input_causes.to_vec(),
+                    host,
+                    depth,
+                )
                 .map(Some);
         }
         "type" => type_builtin(emulator, arguments),
         "umask" => line("0022"),
         _ => return Ok(None),
     };
+    let mut output = output;
+    if output.causes.is_empty()
+        && matches!(
+            name,
+            "grep" | "head" | "tail" | "sort" | "uniq" | "wc" | "tee"
+        )
+    {
+        output.causes = input_causes.to_vec();
+    }
     Ok(Some(output))
 }
 
@@ -520,6 +552,7 @@ fn cat(
     emulator: &BashEmulator,
     arguments: &[String],
     input: &[String],
+    input_causes: &[CausalEntity],
     host: &mut dyn Host,
     depth: usize,
 ) -> CommandOutput {
@@ -530,9 +563,11 @@ fn cat(
     if paths.is_empty() {
         return CommandOutput {
             stdout: input.to_vec(),
+            causes: input_causes.to_vec(),
             ..CommandOutput::default()
         };
     }
+
     let mut output = CommandOutput::default();
     for path in paths {
         let path = emulator.runtime.resolve_path(path);
@@ -544,8 +579,248 @@ fn cat(
         output
             .stdout
             .extend(String::from_utf8_lossy(&bytes).lines().map(str::to_owned));
+        output
+            .causes
+            .push(CausalEntity::VirtualFile { path: path.clone() });
+    }
+    output.causes.sort();
+    output.causes.dedup();
+    output
+}
+
+fn base64_command(
+    emulator: &BashEmulator,
+    arguments: &[String],
+    input: &[String],
+    input_causes: &[CausalEntity],
+    host: &mut dyn Host,
+    depth: usize,
+) -> CommandOutput {
+    let decode = arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-d" | "-D" | "--decode"));
+    let file = arguments.iter().find(|argument| !argument.starts_with('-'));
+    let bytes = if let Some(path) = file {
+        let path = emulator.runtime.resolve_path(path);
+        let Some(bytes) = host.read_file(&path, Engine::Bash, depth) else {
+            return failure(format!("base64: {path}: No such file or directory"));
+        };
+        bytes
+    } else {
+        input.join("\n").into_bytes()
+    };
+    if !decode {
+        return line(base64::engine::general_purpose::STANDARD.encode(bytes));
+    }
+    let encoded = String::from_utf8_lossy(&bytes)
+        .chars()
+        .filter(|ch| !ch.is_whitespace())
+        .collect::<String>();
+    let decoded = match base64::engine::general_purpose::STANDARD.decode(encoded) {
+        Ok(decoded) => decoded,
+        Err(error) => return failure(format!("base64: invalid input: {error}")),
+    };
+    let artifact_id = host.add_artifact(
+        if std::str::from_utf8(&decoded).is_ok() {
+            ArtifactKind::DecodedText
+        } else {
+            ArtifactKind::Binary
+        },
+        "base64-decoded",
+        "application/octet-stream",
+        &decoded,
+        depth,
+    );
+    let artifact = CausalEntity::Artifact { id: artifact_id };
+    for source in input_causes {
+        host.add_causal_edge(CausalEdge {
+            from: source.clone(),
+            to: artifact.clone(),
+            relation: CausalRelation::Decoded,
+            depth,
+        });
+    }
+    host.emit(
+        TraceEvent::new(
+            depth,
+            Engine::Bash,
+            EventKind::Decode,
+            "decoded Base64 with Bash base64 builtin",
+        )
+        .with_data("decoded_bytes", decoded.len().to_string()),
+    );
+    CommandOutput {
+        stdout: String::from_utf8_lossy(&decoded)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        raw_stdout: Some(decoded),
+        causes: vec![artifact],
+        ..CommandOutput::default()
+    }
+}
+
+#[derive(Debug, Default)]
+struct LsOptions {
+    all: bool,
+    almost_all: bool,
+    long: bool,
+}
+
+#[derive(Debug)]
+enum LsEntry {
+    Directory,
+    File { path: String, size: usize },
+}
+
+fn ls(
+    emulator: &BashEmulator,
+    arguments: &[String],
+    host: &mut dyn Host,
+    depth: usize,
+) -> CommandOutput {
+    let mut options = LsOptions::default();
+    let mut targets = Vec::new();
+    let mut parse_options = true;
+    for argument in arguments {
+        if parse_options && argument == "--" {
+            parse_options = false;
+            continue;
+        }
+        if parse_options && argument.starts_with("--") {
+            match argument.as_str() {
+                "--all" => options.all = true,
+                "--almost-all" => options.almost_all = true,
+                "--format=single-column" | "--color" | "--color=auto" | "--color=never" => {}
+                _ => return failure(format!("ls: unrecognized option '{argument}'")),
+            }
+            continue;
+        }
+        if parse_options && argument.starts_with('-') && argument.len() > 1 {
+            for option in argument[1..].chars() {
+                match option {
+                    '1' | 'h' => {}
+                    'a' => options.all = true,
+                    'A' => options.almost_all = true,
+                    'l' => options.long = true,
+                    _ => return failure(format!("ls: invalid option -- '{option}'")),
+                }
+            }
+            continue;
+        }
+        targets.push(argument.clone());
+    }
+    if targets.is_empty() {
+        targets.push(".".into());
+    }
+
+    let multiple_targets = targets.len() > 1;
+    let mut output = CommandOutput::default();
+    for (index, target) in targets.iter().enumerate() {
+        let path = emulator.runtime.resolve_path(target);
+        if host.directory_exists(&path) {
+            if multiple_targets {
+                if index > 0 {
+                    output.stdout.push(String::new());
+                }
+                output.stdout.push(format!("{target}:"));
+            }
+            output
+                .stdout
+                .extend(list_directory(&path, &options, host, depth));
+            continue;
+        }
+        if let Some(bytes) = host.read_file(&path, Engine::Bash, depth) {
+            output.stdout.push(format_ls_entry(
+                target,
+                &LsEntry::File {
+                    path,
+                    size: bytes.len(),
+                },
+                options.long,
+                host,
+            ));
+            continue;
+        }
+        output.stderr.push(format!(
+            "ls: cannot access '{target}': No such file or directory"
+        ));
+        output.code = 2;
     }
     output
+}
+
+fn list_directory(
+    path: &str,
+    options: &LsOptions,
+    host: &mut dyn Host,
+    depth: usize,
+) -> Vec<String> {
+    let mut entries = BTreeMap::new();
+    for directory in host.list_directories(path, Engine::Bash, depth) {
+        if let Some(name) = direct_child_name(path, &directory) {
+            entries.insert(name.to_owned(), LsEntry::Directory);
+        }
+    }
+    for file in host.list_files(path, Engine::Bash, depth) {
+        if let Some(name) = direct_child_name(path, &file) {
+            let size = host
+                .read_file(&file, Engine::Bash, depth)
+                .map_or(0, |bytes| bytes.len());
+            entries.insert(name.to_owned(), LsEntry::File { path: file, size });
+        }
+    }
+    let mut output = Vec::new();
+    if options.all {
+        output.push(format_ls_entry(
+            ".",
+            &LsEntry::Directory,
+            options.long,
+            host,
+        ));
+        output.push(format_ls_entry(
+            "..",
+            &LsEntry::Directory,
+            options.long,
+            host,
+        ));
+    }
+    output.extend(
+        entries
+            .into_iter()
+            .filter(|(name, _)| options.all || options.almost_all || !name.starts_with('.'))
+            .map(|(name, entry)| format_ls_entry(&name, &entry, options.long, host)),
+    );
+    output
+}
+
+fn direct_child_name<'a>(parent: &str, candidate: &'a str) -> Option<&'a str> {
+    let prefix = if parent == "/" {
+        "/".into()
+    } else {
+        format!("{}/", parent.trim_end_matches('/'))
+    };
+    let rest = candidate.strip_prefix(&prefix)?;
+    (!rest.is_empty() && !rest.contains('/')).then_some(rest)
+}
+
+fn format_ls_entry(name: &str, entry: &LsEntry, long: bool, host: &dyn Host) -> String {
+    if !long {
+        return name.into();
+    }
+    match entry {
+        LsEntry::Directory => {
+            format!("drwxr-xr-x 1 analysis analysis        0 Jan  1 00:00 {name}")
+        }
+        LsEntry::File { path, size } => {
+            let mode = if host.is_executable(path) {
+                "-rwxr-xr-x"
+            } else {
+                "-rw-r--r--"
+            };
+            format!("{mode} 1 analysis analysis {size:>8} Jan  1 00:00 {name}")
+        }
+    }
 }
 
 fn copy(
@@ -566,7 +841,17 @@ fn copy(
     let Some(bytes) = host.read_file(&source, Engine::Bash, depth) else {
         return Ok(failure(format!("cp: {source}: No such file")));
     };
-    host.write_file(&target, &bytes, false, Engine::Bash, depth)?;
+    host.write_file_from(
+        &target,
+        &bytes,
+        false,
+        Engine::Bash,
+        depth,
+        &[CausalEntity::VirtualFile {
+            path: source.clone(),
+        }],
+        CausalRelation::Copied,
+    )?;
     Ok(success())
 }
 
@@ -710,6 +995,7 @@ fn tee(
     emulator: &BashEmulator,
     arguments: &[String],
     input: &[String],
+    input_causes: &[CausalEntity],
     host: &mut dyn Host,
     depth: usize,
 ) -> Result<CommandOutput, BashError> {
@@ -723,16 +1009,19 @@ fn tee(
         .iter()
         .filter(|argument| !argument.starts_with('-'))
     {
-        host.write_file(
+        host.write_file_from(
             &emulator.runtime.resolve_path(path),
             &bytes,
             append,
             Engine::Bash,
             depth,
+            input_causes,
+            CausalRelation::Written,
         )?;
     }
     Ok(CommandOutput {
         stdout: input.to_vec(),
+        causes: input_causes.to_vec(),
         ..CommandOutput::default()
     })
 }
@@ -752,10 +1041,10 @@ fn env(
         index += 1;
     }
     if let Some((command, rest)) = arguments[index..].split_first() {
-        if let Some(output) = execute(emulator, command, rest, &[], host, depth)? {
+        if let Some(output) = execute(emulator, command, rest, &[], &[], host, depth)? {
             return Ok(output);
         }
-        return emulator.execute_external(command, rest, Vec::new(), host, depth);
+        return emulator.execute_external(command, rest, Vec::new(), Vec::new(), host, depth);
     }
     let mut entries = host.environment_entries();
     entries.sort();
@@ -826,6 +1115,8 @@ fn is_builtin(name: &str) -> bool {
             | "test"
             | "["
             | "read"
+            | "base64"
+            | "ls"
             | "source"
             | "."
     )

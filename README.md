@@ -9,6 +9,7 @@ an explicit bounded public-HTTP(S) opt-in.
 
 | Package | Purpose |
 | --- | --- |
+| `binary-inspector` | Bounded structural inspection for untrusted PE, ELF, thin Mach-O, and universal Mach-O bytes |
 | `emulator-core` | Shared trace events, evidence, artifacts, limits, host traits, and the in-memory virtual host |
 | `cmd-emulator` | Standalone, tokenized and AST-driven `cmd.exe`/batch emulation with virtual files and typed process intents |
 | `bash-emulator` | Standalone, tokenized and AST-driven Bash emulation on deterministic virtual macOS and Linux hosts |
@@ -39,9 +40,13 @@ The emulator is hermetic by construction:
 - COM handling recognizes an allowlist of common WSH objects.
 - `rundll32` and `regsvr32` inspect virtual PE bytes and known command patterns;
   native code is never executed.
+- Recognized PE, ELF, and Mach-O bytes are structurally inspected on artifact
+  capture, virtual-file writes, executable registration, loader use, and
+  attempted execution. Inspections are cached by SHA-256; native code is never
+  mapped or run.
 - Step, depth, loop, process, file, artifact, decoding, aggregate retained-byte,
-  trace, IOC, and warning limits are configurable. Reaching a limit produces a
-  partial report or a visible limit warning.
+  binary-inspection, trace, IOC, and warning limits are configurable. Reaching
+  a limit produces a partial report or a visible limit warning.
 
 Risk and analysis confidence are separate. Unsupported syntax lowers
 confidence but does not make suspicious evidence disappear or reduce its risk
@@ -105,14 +110,22 @@ before hashing.
   synchronous modeled exit codes. Remote HTA and SCT fixtures can recurse into
   child PowerShell or cmd payloads through runbox.
 - DLL launchers: scriptlet/JavaScript interpretation, URL extraction, hashes,
-  and printable-string inspection of virtual PE files.
+  and bounded structural inspection of virtual PE files.
+- Native binaries: strict, bounded PE/ELF/Mach-O metadata including
+  architecture, type, entry point, sections or segments, imports, exports,
+  dependencies, hardening/signing flags, capability tags, and static
+  indicators. Enrichment includes entropy, overlays, packer markers, PE
+  certificate metadata, Mach-O entitlements, and ELF build IDs/interpreters.
+  Malformed recognized files remain visible as partial reports.
 - Shell associations: `.ps1`, `.cmd`, `.bat`, `.js`, `.vbs`, `.hta`, `.sh`,
   and `.command`.
 - Bash/macOS: span-preserving shell tokenization; variables, parameter defaults,
   positional parameters, command and arithmetic substitution; command lists,
-  pipelines, functions, groups, subshells, `if`, `for`, `while`, and `until`;
-  virtual POSIX files and directories; common shell/file/text builtins; typed
-  external process intents; `bash`, `sh`, and `zsh` dispatch; and modeled
+  pipelines, functions, groups, subshells, `if`, `for`, C-style arithmetic
+  `for`, `while`, and `until`; expandable and quoted heredocs;
+  virtual POSIX files and directories; binary-safe Base64 decoding and common
+  shell/file/text builtins including `ls`; typed external process intents;
+  `bash`, `sh`, and `zsh` dispatch; and modeled
   `osascript`, `launchctl`, `open`, `chmod`, `xattr`, `spctl`, `defaults`, and
   `scutil` behavior.
 - Bash/Linux: deterministic `/home/analysis`, systemd, cron, init, package,
@@ -123,6 +136,11 @@ before hashing.
 Unsupported operations are always traced explicitly. The project does not
 claim complete Windows PowerShell, JScript, VBScript, COM, DOM, or Win32
 compatibility yet.
+
+Report schema version 5 includes typed causal edges between network activity,
+artifacts, virtual files, extraction and decode operations, executable marking,
+and modeled process launches. Detection uses those edges for staged-execution
+and safe-source correlation instead of relying on trace order.
 
 ## CLI
 
@@ -296,6 +314,14 @@ It defaults to a deterministic `/Users/analysis` macOS environment; use
 `--platform linux` for `/home/analysis` and Linux directories/executables.
 External commands become typed process intents; runbox synchronously models
 supported utilities and recursively dispatches `bash`, `sh`, and `zsh`.
+`ls` and Base64 decoding are implemented at the Bash layer, so directory
+listing and exact binary redirection also work in the standalone emulator.
+
+## License
+
+Licensed under either the Apache License, Version 2.0 or the MIT License, at
+your option. See [LICENSE](LICENSE), [LICENSE-APACHE](LICENSE-APACHE), and
+[LICENSE-MIT](LICENSE-MIT).
 
 The Windows script emulator can be used directly for JScript, VBScript, HTA,
 and scriptlet compatibility work:

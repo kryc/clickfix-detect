@@ -2,8 +2,9 @@ use super::{
     bits, builtins, content, decode_utf8, find_switch, is_quoted, is_variable, limited,
     named_or_positional, parse_number, parse_simple_xml, pipeline, providers, recon,
     security_cmdlets, split_windows_command_line, trim_url_punctuation, wildcard_match,
-    ArtifactKind, Engine, EventKind, FlowControl, FunctionDefinition, Host, NetworkIntent,
-    NetworkRequest, PowerShellEmulator, PowerShellError, TraceEvent, Value, URL_RE,
+    ArtifactKind, CausalEntity, CausalRelation, Engine, EventKind, FlowControl, FunctionDefinition,
+    Host, NetworkIntent, NetworkRequest, PowerShellEmulator, PowerShellError, TraceEvent, Value,
+    URL_RE,
 };
 use crate::parser::ParsedSource;
 use std::collections::BTreeMap;
@@ -408,12 +409,18 @@ impl PowerShellEmulator {
                     let output_path = self
                         .eval_expression(parser, output_path, host, depth)?
                         .as_string();
-                    host.write_file(
+                    let sources = host
+                        .latest_network_activity_id()
+                        .map(|id| vec![CausalEntity::NetworkActivity { id }])
+                        .unwrap_or_default();
+                    host.write_file_from(
                         &output_path,
                         &response.body,
                         false,
                         Engine::PowerShell,
                         depth,
+                        &sources,
+                        CausalRelation::Downloaded,
                     )?;
                     return Ok(Some(Value::String(output_path)));
                 }
@@ -458,8 +465,18 @@ impl PowerShellEmulator {
                     Value::Null => Vec::new(),
                     value => split_windows_command_line(&value.as_string()),
                 };
-                Self::spawn(&program, args, "PowerShell Start-Process", host, depth)?;
-                Ok(Some(Value::Object("BlockedProcess".into())))
+                Ok(Some(
+                    match Self::request_process(
+                        &program,
+                        args,
+                        "PowerShell Start-Process",
+                        host,
+                        depth,
+                    )? {
+                        Some(result) => self.process_result_object(&result, host, depth),
+                        None => Value::Object("BlockedProcess".into()),
+                    },
+                ))
             }
             "powershell" | "powershell.exe" | "pwsh" | "pwsh.exe" | "cmd" | "cmd.exe" | "mshta"
             | "mshta.exe" | "wscript" | "wscript.exe" | "cscript" | "cscript.exe" | "rundll32"
@@ -484,22 +501,7 @@ impl PowerShellEmulator {
                     }
                 }
                 match Self::request_process(&command, args, "PowerShell command", host, depth)? {
-                    Some(result) => {
-                        self.variables.insert(
-                            "lastexitcode".into(),
-                            Value::Number(i64::from(result.exit_code)),
-                        );
-                        self.variables
-                            .insert("?".into(), Value::Bool(result.exit_code == 0));
-                        self.error_output.extend(result.stderr);
-                        Ok(Some(match result.stdout.as_slice() {
-                            [] => Value::Null,
-                            [line] => Value::String(line.clone()),
-                            lines => {
-                                Value::Array(lines.iter().cloned().map(Value::String).collect())
-                            }
-                        }))
-                    }
+                    Some(result) => Ok(Some(self.consume_process_output(&result, host, depth))),
                     None => Ok(Some(Value::Object("BlockedProcess".into()))),
                 }
             }

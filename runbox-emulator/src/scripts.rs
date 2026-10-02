@@ -73,7 +73,7 @@ impl Runbox {
                 origin: "mshta remote document".into(),
                 depth,
             }) {
-                self.host.add_artifact(
+                self.add_network_artifact(
                     ArtifactKind::Script,
                     "remote.hta",
                     "application/hta",

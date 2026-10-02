@@ -1,6 +1,7 @@
 [package]
 name = "runbox-emulator"
 version = "0.1.0"
+license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 

@@ -96,6 +96,7 @@ pub fn process_intent_from_command_line(
         depth,
         stdin: Vec::new(),
         current_directory: current_directory.into(),
+        causes: Vec::new(),
     }
 }
 

@@ -86,7 +86,8 @@ impl Runbox {
             );
             return Ok(());
         };
-        let bytes = if project.to_ascii_lowercase().starts_with("http") {
+        let remote = project.to_ascii_lowercase().starts_with("http");
+        let bytes = if remote {
             self.host
                 .network_request(NetworkIntent {
                     method: "GET".into(),
@@ -110,13 +111,23 @@ impl Runbox {
             );
             return Ok(());
         };
-        self.host.add_artifact(
-            ArtifactKind::Script,
-            "msbuild-project.xml",
-            "application/xml",
-            &bytes,
-            intent.depth,
-        );
+        if remote {
+            self.add_network_artifact(
+                ArtifactKind::Script,
+                "msbuild-project.xml",
+                "application/xml",
+                &bytes,
+                intent.depth,
+            );
+        } else {
+            self.host.add_artifact(
+                ArtifactKind::Script,
+                "msbuild-project.xml",
+                "application/xml",
+                &bytes,
+                intent.depth,
+            );
+        }
         let project_text = String::from_utf8_lossy(&bytes);
         let mut dispatched = 0_usize;
         for captures in MSBUILD_EXEC_RE.captures_iter(&project_text) {

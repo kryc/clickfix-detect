@@ -1,4 +1,6 @@
-use emulator_core::{sha256_hex, Engine, EventKind, Host, Ioc, IocKind, NetworkIntent, TraceEvent};
+use emulator_core::{
+    ArtifactKind, CausalEdge, CausalEntity, CausalRelation, Engine, Host, HostError, NetworkIntent,
+};
 use regex::Regex;
 use std::sync::LazyLock;
 
@@ -21,6 +23,53 @@ pub(crate) fn urls(input: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 impl Runbox {
+    pub(crate) fn latest_network_source(&self) -> Vec<CausalEntity> {
+        self.host
+            .latest_network_activity_id()
+            .map(|id| vec![CausalEntity::NetworkActivity { id }])
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn add_network_artifact(
+        &mut self,
+        kind: ArtifactKind,
+        name: &str,
+        media_type: &str,
+        bytes: &[u8],
+        depth: usize,
+    ) -> usize {
+        let sources = self.latest_network_source();
+        let id = self.host.add_artifact(kind, name, media_type, bytes, depth);
+        for source in sources {
+            self.host.add_causal_edge(CausalEdge {
+                from: source,
+                to: CausalEntity::Artifact { id },
+                relation: CausalRelation::Downloaded,
+                depth,
+            });
+        }
+        id
+    }
+
+    pub(crate) fn write_network_file(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        engine: Engine,
+        depth: usize,
+    ) -> Result<(), HostError> {
+        let sources = self.latest_network_source();
+        self.host.write_file_from(
+            path,
+            bytes,
+            false,
+            engine,
+            depth,
+            &sources,
+            CausalRelation::Downloaded,
+        )
+    }
+
     pub(crate) fn inspect_pe(&mut self, path: &str, engine: Engine, depth: usize) {
         let Some(bytes) = self.host.read_file(path, engine, depth) else {
             self.host.unsupported(
@@ -35,26 +84,11 @@ impl Runbox {
                 .unsupported(engine, depth, &format!("{path} is not a PE image"));
             return;
         }
-        self.host.add_ioc(Ioc {
-            kind: IocKind::Sha256,
-            value: sha256_hex(&bytes),
-            source: format!("{engine:?} static PE inspection"),
-            depth,
-        });
+        self.host.inspect_binary_bytes(path, &bytes, engine, depth);
         let strings = ascii_strings(&bytes, 8);
         for value in strings {
             self.record_urls(&value, "static PE string", depth);
         }
-        self.host.emit(
-            TraceEvent::new(
-                depth,
-                engine,
-                EventKind::Parse,
-                format!("statically inspected PE image {path}"),
-            )
-            .with_data("bytes", bytes.len().to_string())
-            .with_data("sha256", sha256_hex(&bytes)),
-        );
     }
 
     pub(crate) fn record_urls(&mut self, input: &str, origin: &str, depth: usize) {

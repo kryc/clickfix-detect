@@ -68,6 +68,7 @@ impl Runbox {
                     depth: intent.depth + 1,
                     stdin: Vec::new(),
                     current_directory: intent.current_directory.clone(),
+                    causes: intent.causes.clone(),
                 })?;
             }
         }

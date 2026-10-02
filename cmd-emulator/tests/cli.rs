@@ -64,7 +64,7 @@ fn trace_reports_process_intent_without_execution() {
     assert!(output.status.success());
     assert!(String::from_utf8(output.stderr)
         .unwrap()
-        .contains("blocked process launch"));
+        .contains("requested process launch"));
 }
 
 #[test]

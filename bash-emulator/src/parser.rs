@@ -49,6 +49,8 @@ struct Parser<'a> {
     source: &'a str,
     tokens: &'a [Token],
     index: usize,
+    heredoc_bodies: Vec<Span>,
+    heredoc_body_index: usize,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -58,6 +60,12 @@ impl<'a> Parser<'a> {
             source,
             tokens,
             index: 0,
+            heredoc_bodies: tokens
+                .iter()
+                .filter(|token| token.kind == TokenKind::HereDocBody)
+                .map(|token| token.span)
+                .collect(),
+            heredoc_body_index: 0,
             diagnostics: Vec::new(),
         }
     }
@@ -259,6 +267,26 @@ impl<'a> Parser<'a> {
             } else {
                 self.parse_word()
             };
+            let here_doc = if kind == Redirect::HereDoc {
+                let rendered = target
+                    .as_ref()
+                    .map_or_else(String::new, |word| self.render_word(word));
+                let quoted = rendered.contains(['\'', '"', '\\']);
+                let delimiter = rendered
+                    .chars()
+                    .filter(|character| !matches!(character, '\'' | '"' | '\\'))
+                    .collect();
+                let body = self.heredoc_bodies.get(self.heredoc_body_index).copied();
+                self.heredoc_body_index = self.heredoc_body_index.saturating_add(1);
+                body.map(|body| crate::ast::HereDoc {
+                    body,
+                    delimiter,
+                    strip_tabs: raw.contains("<<-"),
+                    expand: !quoted,
+                })
+            } else {
+                None
+            };
             redirections.push(Redirection {
                 fd: fd.unwrap_or(default_fd),
                 kind: match kind {
@@ -271,6 +299,7 @@ impl<'a> Parser<'a> {
                 },
                 target,
                 merge_fd,
+                here_doc,
             });
         }
         redirections

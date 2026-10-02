@@ -208,17 +208,17 @@ impl PowerShellEmulator {
             .into_owned())
     }
 
-    pub(crate) fn spawn_command_line(
+    pub(crate) fn request_command_line(
         command_line: &str,
         origin: &str,
         host: &mut dyn Host,
         depth: usize,
-    ) -> Result<(), PowerShellError> {
+    ) -> Result<Option<ProcessResult>, PowerShellError> {
         let words = split_windows_command_line(command_line);
-        if let Some(program) = words.first() {
-            Self::spawn(program, words[1..].to_vec(), origin, host, depth)?;
-        }
-        Ok(())
+        let Some(program) = words.first() else {
+            return Ok(Some(ProcessResult::default()));
+        };
+        Self::request_process(program, words[1..].to_vec(), origin, host, depth)
     }
 
     pub(crate) fn spawn(
@@ -240,6 +240,7 @@ impl PowerShellEmulator {
             depth: depth + 1,
             stdin: Vec::new(),
             current_directory: String::new(),
+            causes: Vec::new(),
         })?;
         Ok(())
     }
@@ -263,7 +264,75 @@ impl PowerShellEmulator {
             depth: depth + 1,
             stdin: Vec::new(),
             current_directory: String::new(),
+            causes: Vec::new(),
         })?)
+    }
+
+    pub(crate) fn consume_process_output(
+        &mut self,
+        result: &ProcessResult,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Value {
+        self.record_process_status(result, host, depth);
+        match result.stdout.as_slice() {
+            [] => Value::Null,
+            [line] => Value::String(line.clone()),
+            lines => Value::Array(lines.iter().cloned().map(Value::String).collect()),
+        }
+    }
+
+    pub(crate) fn process_result_object(
+        &mut self,
+        result: &ProcessResult,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Value {
+        self.record_process_status(result, host, depth);
+        Value::Map(
+            [
+                ("__type".into(), Value::String("ModeledProcess".into())),
+                (
+                    "ExitCode".into(),
+                    Value::Number(i64::from(result.exit_code)),
+                ),
+                ("HasExited".into(), Value::Bool(true)),
+                (
+                    "StandardOutput".into(),
+                    Value::String(result.stdout.join("\n")),
+                ),
+                (
+                    "StandardError".into(),
+                    Value::String(result.stderr.join("\n")),
+                ),
+                ("StdOut".into(), Value::String(result.stdout.join("\n"))),
+                ("StdErr".into(), Value::String(result.stderr.join("\n"))),
+            ]
+            .into_iter()
+            .collect(),
+        )
+    }
+
+    pub(crate) fn record_process_status(
+        &mut self,
+        result: &ProcessResult,
+        host: &mut dyn Host,
+        depth: usize,
+    ) {
+        self.variables.insert(
+            "lastexitcode".into(),
+            Value::Number(i64::from(result.exit_code)),
+        );
+        self.variables
+            .insert("?".into(), Value::Bool(result.exit_code == 0));
+        self.error_output.extend(result.stderr.iter().cloned());
+        for line in &result.stderr {
+            host.emit(
+                TraceEvent::new(depth, Engine::PowerShell, EventKind::Output, line.clone())
+                    .with_data("stream", "stderr")
+                    .with_data("exit_code", result.exit_code.to_string()),
+            );
+        }
     }
 }
 

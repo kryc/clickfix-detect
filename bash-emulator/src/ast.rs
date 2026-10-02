@@ -105,4 +105,13 @@ pub(crate) struct Redirection {
     pub kind: RedirectKind,
     pub target: Option<Word>,
     pub merge_fd: Option<u8>,
+    pub here_doc: Option<HereDoc>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct HereDoc {
+    pub body: Span,
+    pub delimiter: String,
+    pub strip_tabs: bool,
+    pub expand: bool,
 }

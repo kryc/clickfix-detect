@@ -27,6 +27,13 @@ launcher, and persistence effects remain hermetic. Nested processes share
 virtual files, environment variables, registry state, network fixtures,
 resource limits, and trace events.
 
+Recognized PE, ELF, and Mach-O bytes are inspected when they are captured,
+written, marked executable, passed to a modeled loader, or invoked as a
+virtual executable. Reports are cached by SHA-256 and include bounded
+structural metadata; attempted native execution remains explicitly blocked.
+The shared host also records typed causal edges for downloads, decoding,
+copies, extraction, executable marking, and modeled execution.
+
 ```console
 cargo run -p runbox-emulator -- -c "powershell -c \"Write-Output safe\""
 cargo run -p runbox-emulator -- --shell powershell -c "cmd /c echo safe"

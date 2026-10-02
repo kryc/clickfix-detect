@@ -276,5 +276,6 @@ mod tests {
             "http://example.invalid/next"
         )
         .unwrap());
+        assert!(same_origin("https://example.org/start", "https://xn--example-.org/next").is_err());
     }
 }

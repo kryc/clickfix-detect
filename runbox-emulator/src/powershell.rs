@@ -88,7 +88,7 @@ impl Runbox {
         depth: usize,
     ) -> Result<(), RunboxError> {
         let mut emulator = PowerShellEmulator::new();
-        emulator.emulate(script, &mut self.host, depth)?;
+        emulator.emulate(script, self, depth)?;
         Ok(())
     }
 }

@@ -743,6 +743,7 @@ fn start(
         depth,
         stdin: Vec::new(),
         current_directory: emulator.runtime.current_directory.clone(),
+        causes: Vec::new(),
     })?;
     Ok(success())
 }
@@ -796,6 +797,7 @@ fn external(
         depth,
         stdin: emulator.pipe_input.clone().unwrap_or_default(),
         current_directory: emulator.runtime.current_directory.clone(),
+        causes: Vec::new(),
     })?;
     Ok(result.map_or_else(
         || CommandOutput {

@@ -1,3 +1,6 @@
+use binary_inspector::{
+    inspect as inspect_binary, probe_format, BinaryInspection, BinaryInspectionLimits,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
@@ -6,6 +9,10 @@ use thiserror::Error;
 mod network;
 pub mod windows;
 
+pub use binary_inspector::{
+    BinaryCapability, BinaryFormat, BinaryHardening, BinaryImport, BinaryIndicator,
+    BinaryIndicatorKind, BinaryKind, BinarySection, InspectionStatus,
+};
 pub use network::NetworkPolicy;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,6 +28,9 @@ pub struct AnalysisLimits {
     pub max_total_artifact_bytes: usize,
     pub max_virtual_files: usize,
     pub max_total_virtual_file_bytes: usize,
+    pub max_binary_inspections: usize,
+    pub max_binary_inspection_bytes: usize,
+    pub max_causal_edges: usize,
     pub max_trace_events: usize,
     pub max_iocs: usize,
     pub max_warnings: usize,
@@ -39,6 +49,9 @@ impl Default for AnalysisLimits {
             max_total_artifact_bytes: 16 * 1024 * 1024,
             max_virtual_files: 1_024,
             max_total_virtual_file_bytes: 16 * 1024 * 1024,
+            max_binary_inspections: 64,
+            max_binary_inspection_bytes: 8 * 1024 * 1024,
+            max_causal_edges: 4_096,
             max_trace_events: 50_000,
             max_iocs: 4_096,
             max_warnings: 1_024,
@@ -167,6 +180,8 @@ pub struct Artifact {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub text: Option<String>,
     pub truncated: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_inspection_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -179,11 +194,44 @@ pub struct VirtualFileSnapshot {
     pub truncated: bool,
     #[serde(default)]
     pub executable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binary_inspection_sha256: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VirtualDirectorySnapshot {
     pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CausalEntity {
+    NetworkActivity { id: usize },
+    Artifact { id: usize },
+    VirtualFile { path: String },
+    Process { command_line: String },
+    TraceEvent { sequence: usize },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CausalRelation {
+    Downloaded,
+    Decoded,
+    Written,
+    Copied,
+    Extracted,
+    MarkedExecutable,
+    Executed,
+    Derived,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct CausalEdge {
+    pub from: CausalEntity,
+    pub to: CausalEntity,
+    pub relation: CausalRelation,
+    pub depth: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -197,6 +245,8 @@ pub struct ProcessIntent {
     pub stdin: Vec<String>,
     #[serde(default)]
     pub current_directory: String,
+    #[serde(default)]
+    pub causes: Vec<CausalEntity>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -204,6 +254,8 @@ pub struct ProcessResult {
     pub stdout: Vec<String>,
     pub stderr: Vec<String>,
     pub exit_code: i32,
+    #[serde(default)]
+    pub causes: Vec<CausalEntity>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -288,6 +340,20 @@ struct VirtualFile {
     truncated: bool,
     executable: bool,
     baseline: bool,
+    binary_inspection_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinaryInspectionSource {
+    pub name: String,
+    pub engine: Engine,
+    pub depth: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BinaryInspectionRecord {
+    pub inspection: BinaryInspection,
+    pub sources: Vec<BinaryInspectionSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -296,6 +362,8 @@ enum RetentionLimit {
     Ioc,
     Artifact,
     Warning,
+    BinaryInspection,
+    CausalEdge,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -308,6 +376,10 @@ pub struct HostSnapshot {
     pub virtual_files: Vec<VirtualFileSnapshot>,
     #[serde(default)]
     pub virtual_directories: Vec<VirtualDirectorySnapshot>,
+    #[serde(default)]
+    pub binary_inspections: Vec<BinaryInspectionRecord>,
+    #[serde(default)]
+    pub causal_edges: Vec<CausalEdge>,
     #[serde(default)]
     pub network_activity: Vec<NetworkActivity>,
     pub warnings: Vec<String>,
@@ -368,6 +440,34 @@ pub trait Host {
         engine: Engine,
         depth: usize,
     ) -> Result<(), HostError>;
+    /// Writes a virtual file and records typed causal edges from its sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same virtual-host limit errors as [`Host::write_file`].
+    #[allow(clippy::too_many_arguments)]
+    fn write_file_from(
+        &mut self,
+        path: &str,
+        bytes: &[u8],
+        append: bool,
+        engine: Engine,
+        depth: usize,
+        sources: &[CausalEntity],
+        relation: CausalRelation,
+    ) -> Result<(), HostError> {
+        self.write_file(path, bytes, append, engine, depth)?;
+        let target = CausalEntity::VirtualFile { path: path.into() };
+        for source in sources {
+            self.add_causal_edge(CausalEdge {
+                from: source.clone(),
+                to: target.clone(),
+                relation,
+                depth,
+            });
+        }
+        Ok(())
+    }
     fn read_file(&mut self, path: &str, engine: Engine, depth: usize) -> Option<Vec<u8>>;
     fn delete_file(&mut self, path: &str, engine: Engine, depth: usize) -> bool;
     fn list_files(&mut self, prefix: &str, engine: Engine, depth: usize) -> Vec<String>;
@@ -420,6 +520,10 @@ pub trait Host {
     fn network_request_detailed(&mut self, request: NetworkRequest) -> Option<NetworkResponse> {
         self.network_request(request.into())
     }
+    fn latest_network_activity_id(&self) -> Option<usize> {
+        None
+    }
+    fn add_causal_edge(&mut self, edge: CausalEdge);
 
     /// Queue a process intent for recursive runbox dispatch.
     ///
@@ -454,6 +558,8 @@ pub struct VirtualHost {
     trace: Vec<TraceEvent>,
     iocs: Vec<Ioc>,
     artifacts: Vec<Artifact>,
+    binary_inspections: BTreeMap<String, BinaryInspectionRecord>,
+    causal_edges: Vec<CausalEdge>,
     files: BTreeMap<String, VirtualFile>,
     directories: BTreeMap<String, bool>,
     environment: BTreeMap<String, String>,
@@ -518,6 +624,7 @@ impl VirtualHost {
                         truncated: false,
                         executable: true,
                         baseline: true,
+                        binary_inspection_sha256: None,
                     },
                 )
             })
@@ -531,6 +638,7 @@ impl VirtualHost {
                         truncated: false,
                         executable: false,
                         baseline: true,
+                        binary_inspection_sha256: None,
                     },
                 );
             }
@@ -542,6 +650,8 @@ impl VirtualHost {
             trace: Vec::new(),
             iocs: Vec::new(),
             artifacts: Vec::new(),
+            binary_inspections: BTreeMap::new(),
+            causal_edges: Vec::new(),
             files,
             directories,
             environment,
@@ -1004,12 +1114,27 @@ impl VirtualHost {
             source: intent.origin.clone(),
             depth: intent.depth,
         });
+        let process = CausalEntity::Process {
+            command_line: intent.command_line.clone(),
+        };
+        let mut causes = intent.causes.clone();
+        if let Some(path) = self.process_file_path(intent) {
+            causes.push(CausalEntity::VirtualFile { path });
+        }
+        for cause in causes {
+            self.push_causal_edge(CausalEdge {
+                from: cause,
+                to: process.clone(),
+                relation: CausalRelation::Executed,
+                depth: intent.depth,
+            });
+        }
         self.emit(
             TraceEvent::new(
                 intent.depth,
                 Engine::Runbox,
                 EventKind::ProcessIntent,
-                format!("blocked process launch: {}", intent.command_line),
+                format!("requested process launch: {}", intent.command_line),
             )
             .with_data("program", &intent.program)
             .with_data("command_line", &intent.command_line)
@@ -1138,6 +1263,129 @@ impl VirtualHost {
             .collect()
     }
 
+    pub fn inspect_binary_bytes(
+        &mut self,
+        name: &str,
+        bytes: &[u8],
+        engine: Engine,
+        depth: usize,
+    ) -> Option<String> {
+        probe_format(bytes)?;
+        let sha256 = sha256_hex(bytes);
+        let source = BinaryInspectionSource {
+            name: name.into(),
+            engine,
+            depth,
+        };
+        if let Some(record) = self.binary_inspections.get_mut(&sha256) {
+            if !record.sources.contains(&source) {
+                if record.sources.len() < 32 {
+                    record.sources.push(source);
+                } else if !record
+                    .inspection
+                    .warnings
+                    .iter()
+                    .any(|warning| warning == "binary inspection source list truncated")
+                {
+                    record.inspection.status = InspectionStatus::Partial;
+                    record
+                        .inspection
+                        .warnings
+                        .push("binary inspection source list truncated".into());
+                }
+            }
+            let format = format!("{:?}", record.inspection.format).to_ascii_lowercase();
+            self.emit(
+                TraceEvent::new(
+                    depth,
+                    engine,
+                    EventKind::Parse,
+                    format!("reused cached binary inspection for {name}"),
+                )
+                .with_data("sha256", &sha256)
+                .with_data("format", format)
+                .with_data("cached", "true"),
+            );
+            return Some(sha256);
+        }
+        if self.binary_inspections.len() >= self.limits.max_binary_inspections {
+            if self
+                .retention_limits_reached
+                .insert(RetentionLimit::BinaryInspection)
+            {
+                self.record_limit(engine, depth, "binary inspection count limit reached");
+            }
+            return None;
+        }
+        let inspection_limits = BinaryInspectionLimits {
+            max_inspected_bytes: self.limits.max_binary_inspection_bytes,
+            ..BinaryInspectionLimits::default()
+        };
+        let inspection = inspect_binary(bytes, &inspection_limits)?;
+        let partial = inspection.status == InspectionStatus::Partial;
+        let format = format!("{:?}", inspection.format).to_ascii_lowercase();
+        for indicator in &inspection.indicators {
+            let kind = match indicator.kind {
+                BinaryIndicatorKind::Url => IocKind::Url,
+                BinaryIndicatorKind::Domain => IocKind::Domain,
+                BinaryIndicatorKind::IpAddress => IocKind::IpAddress,
+                BinaryIndicatorKind::Path => IocKind::FilePath,
+            };
+            self.add_ioc(Ioc {
+                kind,
+                value: indicator.value.clone(),
+                source: format!("{engine:?} static binary string"),
+                depth,
+            });
+        }
+        self.add_ioc(Ioc {
+            kind: IocKind::Sha256,
+            value: sha256.clone(),
+            source: format!("{engine:?} static binary inspection"),
+            depth,
+        });
+        self.binary_inspections.insert(
+            sha256.clone(),
+            BinaryInspectionRecord {
+                inspection,
+                sources: vec![source],
+            },
+        );
+        self.emit(
+            TraceEvent::new(
+                depth,
+                engine,
+                EventKind::Parse,
+                format!("statically inspected binary {name}"),
+            )
+            .with_data("sha256", &sha256)
+            .with_data("format", format)
+            .with_data("bytes", bytes.len().to_string())
+            .with_data("partial", partial.to_string()),
+        );
+        Some(sha256)
+    }
+
+    #[must_use]
+    pub fn latest_network_activity_id(&self) -> Option<usize> {
+        (!self.network_activity.is_empty()).then_some(self.network_activity.len())
+    }
+
+    pub fn inspect_virtual_binary(
+        &mut self,
+        path: &str,
+        engine: Engine,
+        depth: usize,
+    ) -> Option<String> {
+        let normalized = self.normalize_path(path);
+        let bytes = self.files.get(&normalized)?.bytes.clone();
+        let sha256 = self.inspect_binary_bytes(&normalized, &bytes, engine, depth)?;
+        if let Some(file) = self.files.get_mut(&normalized) {
+            file.binary_inspection_sha256 = Some(sha256.clone());
+        }
+        Some(sha256)
+    }
+
     pub fn set_environment_variable(&mut self, name: &str, value: &str) {
         self.set_environment(name, value);
     }
@@ -1179,6 +1427,7 @@ impl VirtualHost {
                 text: String::from_utf8(file.bytes.clone()).ok(),
                 truncated: file.truncated,
                 executable: file.executable,
+                binary_inspection_sha256: file.binary_inspection_sha256.clone(),
             })
             .collect();
         let virtual_directories = self
@@ -1195,6 +1444,8 @@ impl VirtualHost {
             artifacts: self.artifacts.clone(),
             virtual_files,
             virtual_directories,
+            binary_inspections: self.binary_inspections.values().cloned().collect(),
+            causal_edges: self.causal_edges.clone(),
             network_activity: self.network_activity.clone(),
             warnings: self.warnings.clone(),
             unsupported_operations: self.unsupported_operations,
@@ -1227,6 +1478,48 @@ impl VirtualHost {
             return;
         }
         self.warnings.push(warning);
+    }
+
+    fn push_causal_edge(&mut self, edge: CausalEdge) {
+        if self.causal_edges.contains(&edge) {
+            return;
+        }
+        if self.causal_edges.len() >= self.limits.max_causal_edges {
+            if self
+                .retention_limits_reached
+                .insert(RetentionLimit::CausalEdge)
+            {
+                self.limits_reached += 1;
+                self.push_bounded_warning("causal edge limit reached".into());
+            }
+            return;
+        }
+        self.causal_edges.push(edge);
+    }
+
+    fn process_file_path(&self, intent: &ProcessIntent) -> Option<String> {
+        let direct = self.normalize_path(&intent.program);
+        if self.files.contains_key(&direct) {
+            return Some(direct);
+        }
+        if intent.current_directory.is_empty()
+            || intent.program.starts_with(['/', '\\'])
+            || intent
+                .program
+                .as_bytes()
+                .get(1)
+                .is_some_and(|separator| *separator == b':')
+        {
+            return None;
+        }
+        let candidate = format!(
+            "{}{}{}",
+            intent.current_directory.trim_end_matches(['/', '\\']),
+            self.path_separator(),
+            intent.program
+        );
+        let normalized = self.normalize_path(&candidate);
+        self.files.contains_key(&normalized).then_some(normalized)
     }
 
     fn ensure_parent_directories(&mut self, path: &str) {
@@ -1438,10 +1731,15 @@ impl Host for VirtualHost {
                     self.limits_reached += 1;
                     self.push_bounded_warning("IOC limit reached".into());
                 }
+
                 return;
             }
             self.iocs.push(ioc);
         }
+    }
+
+    fn add_causal_edge(&mut self, edge: CausalEdge) {
+        self.push_causal_edge(edge);
     }
 
     fn add_artifact(
@@ -1476,6 +1774,8 @@ impl Host for VirtualHost {
         let stored = &bytes[..retained_limit];
         let truncated = retained_limit < bytes.len();
         let id = self.artifacts.len() + 1;
+        let binary_inspection_sha256 =
+            self.inspect_binary_bytes(name, bytes, Engine::Runbox, depth);
         self.artifacts.push(Artifact {
             id,
             kind,
@@ -1485,6 +1785,7 @@ impl Host for VirtualHost {
             sha256: sha256_hex(bytes),
             text: String::from_utf8(stored.to_vec()).ok(),
             truncated,
+            binary_inspection_sha256,
         });
         self.emit(
             TraceEvent::new(
@@ -1550,11 +1851,13 @@ impl Host for VirtualHost {
             truncated: false,
             executable: false,
             baseline: false,
+            binary_inspection_sha256: None,
         });
         file.baseline = false;
         if !append {
             file.bytes.clear();
             file.truncated = false;
+            file.binary_inspection_sha256 = None;
         }
         let remaining = self
             .limits
@@ -1574,6 +1877,18 @@ impl Host for VirtualHost {
             .files
             .get(&normalized)
             .map_or_else(Vec::new, |entry| entry.bytes.clone());
+        let final_sha256 = sha256_hex(&final_bytes);
+        let inspection_bytes = if append {
+            final_bytes.as_slice()
+        } else {
+            bytes
+        };
+        let binary_inspection_sha256 =
+            self.inspect_binary_bytes(&normalized, inspection_bytes, engine, depth);
+        if let Some(file) = self.files.get_mut(&normalized) {
+            file.binary_inspection_sha256 =
+                binary_inspection_sha256.filter(|sha256| sha256 == &final_sha256);
+        }
         self.add_ioc(Ioc {
             kind: IocKind::FilePath,
             value: normalized.clone(),
@@ -1590,7 +1905,7 @@ impl Host for VirtualHost {
             .with_data("path", &normalized)
             .with_data("bytes", bytes.len().to_string())
             .with_data("append", append.to_string())
-            .with_data("sha256", sha256_hex(&final_bytes)),
+            .with_data("sha256", final_sha256),
         );
         Ok(())
     }
@@ -1754,9 +2069,16 @@ impl Host for VirtualHost {
             truncated: false,
             executable: true,
             baseline: false,
+            binary_inspection_sha256: None,
         });
         file.executable = true;
         file.baseline = false;
+        let bytes = file.bytes.clone();
+        let binary_inspection_sha256 =
+            self.inspect_binary_bytes(&normalized, &bytes, engine, depth);
+        if let Some(file) = self.files.get_mut(&normalized) {
+            file.binary_inspection_sha256 = binary_inspection_sha256;
+        }
         self.emit(
             TraceEvent::new(
                 depth,
@@ -1764,9 +2086,19 @@ impl Host for VirtualHost {
                 EventKind::FileWrite,
                 format!("registered virtual executable {normalized}"),
             )
-            .with_data("path", normalized)
+            .with_data("path", &normalized)
             .with_data("entry_type", "executable"),
         );
+        if let Some(sequence) = self.trace.last().map(|event| event.sequence) {
+            self.push_causal_edge(CausalEdge {
+                from: CausalEntity::VirtualFile {
+                    path: normalized.clone(),
+                },
+                to: CausalEntity::TraceEvent { sequence },
+                relation: CausalRelation::MarkedExecutable,
+                depth,
+            });
+        }
         Ok(())
     }
 
@@ -1977,6 +2309,7 @@ impl Host for VirtualHost {
                 .data
                 .insert("request_headers".into(), headers.to_string());
         }
+
         if let Some(response) = exact {
             self.record_network_response(activity_index, &response, NetworkOutcome::Fixture);
             return Some(response);
@@ -2003,6 +2336,10 @@ impl Host for VirtualHost {
             self.record_network_response(activity_index, response, NetworkOutcome::Blocked);
         }
         response
+    }
+
+    fn latest_network_activity_id(&self) -> Option<usize> {
+        VirtualHost::latest_network_activity_id(self)
     }
 
     fn process_intent(&mut self, intent: ProcessIntent) -> Result<(), HostError> {
@@ -2087,6 +2424,31 @@ fn extract_url_host(url: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    fn minimal_elf64() -> Vec<u8> {
+        let mut bytes = vec![0_u8; 120];
+        bytes[0..4].copy_from_slice(b"\x7fELF");
+        bytes[4] = 2;
+        bytes[5] = 1;
+        bytes[6] = 1;
+        bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+        bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+        bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[24..32].copy_from_slice(&0x0040_0078_u64.to_le_bytes());
+        bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+        bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+        bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+        bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+        bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+        bytes[68..72].copy_from_slice(&5_u32.to_le_bytes());
+        bytes[80..88].copy_from_slice(&0x0040_0000_u64.to_le_bytes());
+        bytes[88..96].copy_from_slice(&0x0040_0000_u64.to_le_bytes());
+        bytes[96..104].copy_from_slice(&120_u64.to_le_bytes());
+        bytes[104..112].copy_from_slice(&120_u64.to_le_bytes());
+        bytes[112..120].copy_from_slice(&0x1000_u64.to_le_bytes());
+        bytes
+    }
+
     #[test]
     fn virtual_host_records_but_does_not_execute_network_intents() {
         let mut host = VirtualHost::new(AnalysisLimits::default());
@@ -2167,6 +2529,60 @@ mod tests {
         assert_eq!(snapshot.iocs.len(), 1);
         assert!(snapshot.limits_reached >= 3);
         assert!(!snapshot.warnings.is_empty());
+    }
+
+    #[test]
+    fn binary_inspection_uses_original_bytes_and_caches_by_hash() {
+        let limits = AnalysisLimits {
+            max_artifact_bytes: 64,
+            max_total_virtual_file_bytes: 256,
+            ..AnalysisLimits::default()
+        };
+        let bytes = minimal_elf64();
+        let mut host = VirtualHost::linux(limits);
+
+        host.add_virtual_file("/tmp/payload", &bytes).unwrap();
+        host.add_virtual_file("/tmp/copy", &bytes).unwrap();
+
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot.binary_inspections.len(), 1);
+        assert_eq!(snapshot.binary_inspections[0].inspection.original_size, 120);
+        assert_eq!(
+            snapshot.binary_inspections[0].inspection.inspected_bytes,
+            120
+        );
+        assert_eq!(snapshot.binary_inspections[0].sources.len(), 2);
+        assert_eq!(
+            snapshot
+                .virtual_files
+                .iter()
+                .find(|file| file.path == "/tmp/payload")
+                .map(|file| file.size),
+            Some(64)
+        );
+        assert!(snapshot
+            .virtual_files
+            .iter()
+            .all(|file| file.binary_inspection_sha256.is_none()));
+    }
+
+    #[test]
+    fn malformed_binary_magic_is_retained_as_partial_inspection() {
+        let mut host = VirtualHost::new(AnalysisLimits::default());
+
+        host.add_virtual_file(r"C:\Temp\broken.exe", b"MZ-broken")
+            .unwrap();
+
+        let snapshot = host.snapshot();
+        assert_eq!(snapshot.binary_inspections.len(), 1);
+        assert_eq!(
+            snapshot.binary_inspections[0].inspection.status,
+            InspectionStatus::Partial
+        );
+        assert!(!snapshot.binary_inspections[0]
+            .inspection
+            .warnings
+            .is_empty());
     }
 
     #[test]
@@ -2416,6 +2832,7 @@ mod tests {
             depth: 1,
             stdin: Vec::new(),
             current_directory: r"C:\Users\analysis".into(),
+            causes: Vec::new(),
         };
 
         assert_eq!(host.process_request(intent.clone()).unwrap(), None);

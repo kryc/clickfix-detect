@@ -384,9 +384,13 @@ fn execute_powershell(
 ) -> Result<(), Box<dyn std::error::Error>> {
     let result = emulator.emulate(script, runbox, 0);
     let stdout = emulator.drain_stdout();
+    let stderr = emulator.drain_stderr();
     let drain_result = runbox.drain_pending_processes();
     for line in stdout {
         println!("{line}");
+    }
+    for line in stderr {
+        eprintln!("{line}");
     }
     result?;
     drain_result?;

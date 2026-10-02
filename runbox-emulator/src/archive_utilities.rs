@@ -1,6 +1,6 @@
 use std::io::{Cursor, Read};
 
-use emulator_core::{ArtifactKind, Engine, Host, ProcessIntent};
+use emulator_core::{ArtifactKind, CausalEntity, CausalRelation, Engine, Host, ProcessIntent};
 use zip::ZipArchive;
 
 use crate::command_line::resolve_process_path;
@@ -156,8 +156,17 @@ impl Runbox {
                 destination.trim_end_matches(['\\', '/']),
                 name.replace('/', "\\")
             );
-            self.host
-                .write_file(&path, &bytes, false, Engine::Runbox, depth)?;
+            self.host.write_file_from(
+                &path,
+                &bytes,
+                false,
+                Engine::Runbox,
+                depth,
+                &[CausalEntity::VirtualFile {
+                    path: source.into(),
+                }],
+                CausalRelation::Extracted,
+            )?;
         }
         self.emit_utility_result(&["Archive expanded.".into()], &[], 0, depth);
         Ok(())

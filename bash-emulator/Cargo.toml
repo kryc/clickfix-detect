@@ -1,10 +1,12 @@
 [package]
 name = "bash-emulator"
 version = "0.1.0"
+license.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+base64.workspace = true
 emulator-core = { path = "../emulator-core" }
 serde.workspace = true
 thiserror.workspace = true

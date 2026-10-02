@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal \
+            --component rustfmt,clippy \
+            --target wasm32-unknown-unknown
+          rustup default 1.85.1
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run Clippy
+        run: cargo clippy --locked --workspace --all-targets -- -D warnings
+
+      - name: Run tests
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Check WebAssembly release build
+        run: cargo check --locked -p clickfix-wasm --target wasm32-unknown-unknown --release
+
+      - name: Compile fuzz targets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for manifest in \
+            binary-inspector/fuzz/Cargo.toml \
+            bash-emulator/fuzz/Cargo.toml \
+            cmd-emulator/fuzz/Cargo.toml \
+            powershell-emulator/fuzz/Cargo.toml \
+            windows-script-emulator/fuzz/Cargo.toml
+          do
+            cargo check --locked --manifest-path "$manifest" --bins
+          done
+
+      - name: Install cargo-audit
+        run: cargo install cargo-audit --version 0.22.1 --locked
+
+      - name: Audit dependencies
+        run: cargo audit

@@ -283,7 +283,7 @@ impl PowerShellEmulator {
             .iter()
             .map(|argument| {
                 self.eval_expression(parser, parser.text(argument.range), host, depth)
-                    .map(|value| quote_argument(&value.as_string()))
+                    .map(|value| value.as_string())
             })
             .collect::<Result<Vec<_>, _>>()?;
         if looks_like_script(&target_text) {
@@ -296,7 +296,14 @@ impl PowerShellEmulator {
             );
             return self.execute_source(&target_text, host, depth + 1);
         }
-        let expanded_command = format!("{} {}", target_text, evaluated_arguments.join(" "));
+        let expanded_command = std::iter::once(target_text.clone())
+            .chain(
+                evaluated_arguments
+                    .iter()
+                    .map(|argument| quote_argument(argument)),
+            )
+            .collect::<Vec<_>>()
+            .join(" ");
         let expanded_parser = ParsedSource::parse(&expanded_command)
             .map_err(|diagnostic| PowerShellError::Parser(diagnostic.to_string()))?;
         if self.looks_like_command_expression(&expanded_parser, expanded_parser.source()) {
@@ -310,17 +317,17 @@ impl PowerShellEmulator {
         if let Some(bytes) = host.read_file(&target_text, Engine::PowerShell, depth) {
             return self.execute_source(&decode_utf8(&bytes), host, depth + 1);
         }
-        let command_line = std::iter::once(target_text.as_str())
-            .chain(evaluated_arguments.iter().map(String::as_str))
-            .collect::<Vec<_>>()
-            .join(" ");
         let origin = if dot_source {
             "PowerShell dot-source operator"
         } else {
             "PowerShell invocation operator"
         };
-        Self::spawn_command_line(&command_line, origin, host, depth)?;
-        Ok(Some(target))
+        Ok(Some(
+            match Self::request_process(&target_text, evaluated_arguments, origin, host, depth)? {
+                Some(result) => self.consume_process_output(&result, host, depth),
+                None => Value::Object("BlockedProcess".into()),
+            },
+        ))
     }
 
     fn execute_ast_assignment(
@@ -783,7 +790,6 @@ impl PowerShellEmulator {
             StatementKind::Assignment { .. }
                 | StatementKind::CompoundAssignment { .. }
                 | StatementKind::Increment { .. }
-                | StatementKind::Invocation { .. }
                 | StatementKind::Function { .. }
                 | StatementKind::OpaqueDeclaration
                 | StatementKind::Param(_)

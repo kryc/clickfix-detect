@@ -15,11 +15,14 @@ Supported language surfaces include:
   parameters, command substitution, backticks, arithmetic substitution, and
   tilde expansion;
 - command lists, `&&`, `||`, pipelines, groups, subshells, functions, `if`,
-  `for`, `while`, and `until`;
+  `for`, C-style arithmetic `for`, `while`, and `until`;
 - assignments, exported variables, shell functions, positional arguments,
   return/exit/break/continue flow, and bounded loops;
-- stdin/stdout/stderr pipelines and file redirection;
-- common builtins and virtual filesystem operations.
+- stdin/stdout/stderr pipelines, expandable and quoted heredocs, `<<-` tab
+  stripping, and file redirection, including binary-safe `base64 -d > file`
+  output;
+- common builtins and virtual filesystem operations, including deterministic
+  `ls`, `ls -a`/`-A`, `ls -l`, and explicit file or directory arguments.
 
 ```console
 cargo run -p bash-emulator -- -c 'name=world; echo "hello $name"'

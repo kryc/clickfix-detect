@@ -1,0 +1,36 @@
+[package]
+name = "binary-inspector-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+binary-inspector = { path = ".." }
+libfuzzer-sys = "0.4.10"
+
+[[bin]]
+name = "pe"
+path = "fuzz_targets/pe.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "elf"
+path = "fuzz_targets/elf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "macho"
+path = "fuzz_targets/macho.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
+members = ["."]

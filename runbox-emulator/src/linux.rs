@@ -121,6 +121,7 @@ impl Runbox {
             depth: intent.depth + 1,
             stdin: intent.stdin.clone(),
             current_directory: intent.current_directory.clone(),
+            causes: intent.causes.clone(),
         };
         self.host.record_process_request(&nested)?;
         self.dispatch_process(&nested)
@@ -283,6 +284,7 @@ impl Runbox {
                     depth: intent.depth + 1,
                     stdin: Vec::new(),
                     current_directory: intent.current_directory.clone(),
+                    causes: intent.causes.clone(),
                 })?;
             }
         }

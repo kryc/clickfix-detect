@@ -7,7 +7,10 @@ mod runtime;
 pub mod tokenizer;
 
 use ast::{Command, ListOperator, Pipeline, Program, RedirectKind, Redirection, SimpleCommand};
-use emulator_core::{Engine, EventKind, Host, HostError, ProcessIntent, ProcessResult, TraceEvent};
+use emulator_core::{
+    CausalEdge, CausalEntity, CausalRelation, Engine, EventKind, Host, HostError, ProcessIntent,
+    ProcessResult, TraceEvent,
+};
 use parser::ParsedDocument;
 use runtime::{FlowControl, Runtime};
 use serde::{Deserialize, Serialize};
@@ -56,13 +59,16 @@ pub enum BashError {
 pub struct BashEmulator {
     runtime: Runtime,
     pipe_input: Option<Vec<String>>,
+    pipe_causes: Vec<CausalEntity>,
 }
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct CommandOutput {
     pub stdout: Vec<String>,
+    pub raw_stdout: Option<Vec<u8>>,
     pub stderr: Vec<String>,
     pub code: i32,
+    pub causes: Vec<CausalEntity>,
 }
 
 impl BashEmulator {
@@ -242,7 +248,16 @@ impl BashEmulator {
             }
             let mut output = self.execute_pipeline(document, &item.pipeline, host, depth)?;
             aggregate.stdout.append(&mut output.stdout);
+            if let Some(bytes) = output.raw_stdout.take() {
+                aggregate
+                    .raw_stdout
+                    .get_or_insert_with(Vec::new)
+                    .extend(bytes);
+            }
             aggregate.stderr.append(&mut output.stderr);
+            aggregate.causes.append(&mut output.causes);
+            aggregate.causes.sort();
+            aggregate.causes.dedup();
             aggregate.code = output.code;
             self.runtime.last_status = output.code;
         }
@@ -257,12 +272,14 @@ impl BashEmulator {
         depth: usize,
     ) -> Result<CommandOutput, BashError> {
         let previous_input = self.pipe_input.take();
+        let previous_causes = std::mem::take(&mut self.pipe_causes);
         let mut aggregate_stderr = Vec::new();
         let mut output = CommandOutput::default();
         for (index, command) in pipeline.commands.iter().enumerate() {
             output = if pipeline.commands.len() > 1 {
                 let mut stage = self.clone();
                 stage.pipe_input = self.pipe_input.take();
+                stage.pipe_causes = std::mem::take(&mut self.pipe_causes);
                 stage.execute_command(document, command, host, depth)?
             } else {
                 self.execute_command(document, command, host, depth)?
@@ -270,9 +287,12 @@ impl BashEmulator {
             aggregate_stderr.append(&mut output.stderr);
             if index + 1 < pipeline.commands.len() {
                 self.pipe_input = Some(std::mem::take(&mut output.stdout));
+                self.pipe_causes = std::mem::take(&mut output.causes);
+                output.raw_stdout = None;
             }
         }
         self.pipe_input = previous_input;
+        self.pipe_causes = previous_causes;
         output.stderr = aggregate_stderr;
         if pipeline.negated {
             output.code = i32::from(output.code == 0);
@@ -378,7 +398,7 @@ impl BashEmulator {
                 update,
                 body,
             } => {
-                self.evaluate_arithmetic_expression(initializer, host);
+                self.execute_arithmetic_statement(initializer, host, depth);
                 let mut aggregate = CommandOutput::default();
                 for index in 0..host.limits().max_loop_iterations {
                     if !condition.is_empty()
@@ -399,7 +419,7 @@ impl BashEmulator {
                         FlowControl::Return(_) | FlowControl::Exit(_) => break,
                         FlowControl::None => {}
                     }
-                    self.evaluate_arithmetic_expression(update, host);
+                    self.execute_arithmetic_statement(update, host, depth);
                     if index + 1 == host.limits().max_loop_iterations {
                         return Err(BashError::LoopLimit {
                             limit: host.limits().max_loop_iterations,
@@ -453,7 +473,7 @@ impl BashEmulator {
                 CommandOutput::default()
             }
             Command::Arithmetic { expression } => CommandOutput {
-                code: i32::from(self.evaluate_arithmetic_expression(expression, host) == 0),
+                code: i32::from(self.execute_arithmetic_statement(expression, host, depth) == 0),
                 ..CommandOutput::default()
             },
             Command::Conditional { expression } => {
@@ -580,6 +600,7 @@ impl BashEmulator {
         }
         let arguments = &words[assignment_count..];
         let mut input = self.pipe_input.take().unwrap_or_default();
+        let input_causes = std::mem::take(&mut self.pipe_causes);
         self.apply_input_redirections(document, &command.redirections, &mut input, host, depth)?;
         let mut output = if let Some((name, arguments)) = arguments.split_first() {
             host.emit(
@@ -607,11 +628,11 @@ impl BashEmulator {
                 self.runtime.positional = previous;
                 output
             } else if let Some(output) =
-                builtins::execute(self, name, arguments, &input, host, depth)?
+                builtins::execute(self, name, arguments, &input, &input_causes, host, depth)?
             {
                 output
             } else {
-                self.execute_external(name, arguments, input, host, depth)?
+                self.execute_external(name, arguments, input, input_causes, host, depth)?
             }
         } else {
             CommandOutput::default()
@@ -667,10 +688,45 @@ impl BashEmulator {
                     };
                     *input = vec![self.expand_word(document, target, host, depth)?];
                 }
+                RedirectKind::HereDoc => {
+                    let Some(here_doc) = &redirection.here_doc else {
+                        continue;
+                    };
+                    let mut body = Self::extract_heredoc_body(document.source(), here_doc);
+                    if here_doc.expand {
+                        body = self.expand_text(&body, host, depth)?;
+                    }
+                    *input = body.lines().map(str::to_owned).collect();
+                }
                 _ => {}
             }
         }
         Ok(())
+    }
+
+    fn extract_heredoc_body(source: &str, here_doc: &ast::HereDoc) -> String {
+        let raw = &source[here_doc.body.start..here_doc.body.end];
+        let mut body = String::new();
+        for line in raw.split_inclusive('\n') {
+            let comparison = line
+                .trim_end_matches(['\r', '\n'])
+                .strip_prefix('\u{feff}')
+                .unwrap_or_else(|| line.trim_end_matches(['\r', '\n']));
+            let comparison = if here_doc.strip_tabs {
+                comparison.trim_start_matches('\t')
+            } else {
+                comparison
+            };
+            if comparison == here_doc.delimiter {
+                break;
+            }
+            if here_doc.strip_tabs {
+                body.push_str(line.trim_start_matches('\t'));
+            } else {
+                body.push_str(line);
+            }
+        }
+        body
     }
 
     fn apply_output_redirections(
@@ -706,7 +762,15 @@ impl BashEmulator {
             } else {
                 std::mem::take(&mut output.stdout)
             };
-            let bytes = if lines.is_empty() {
+            let bytes = if redirection.fd == 1 {
+                output.raw_stdout.take().unwrap_or_else(|| {
+                    if lines.is_empty() {
+                        Vec::new()
+                    } else {
+                        format!("{}\n", lines.join("\n")).into_bytes()
+                    }
+                })
+            } else if lines.is_empty() {
                 Vec::new()
             } else {
                 format!("{}\n", lines.join("\n")).into_bytes()
@@ -718,6 +782,22 @@ impl BashEmulator {
                 Engine::Bash,
                 depth,
             )?;
+            let target = CausalEntity::VirtualFile { path };
+            for source in &output.causes {
+                host.add_causal_edge(CausalEdge {
+                    from: source.clone(),
+                    to: target.clone(),
+                    relation: match source {
+                        CausalEntity::NetworkActivity { .. } => CausalRelation::Downloaded,
+                        CausalEntity::Artifact { .. } => CausalRelation::Decoded,
+                        CausalEntity::VirtualFile { .. } => CausalRelation::Copied,
+                        CausalEntity::Process { .. } | CausalEntity::TraceEvent { .. } => {
+                            CausalRelation::Written
+                        }
+                    },
+                    depth,
+                });
+            }
         }
         Ok(())
     }
@@ -727,6 +807,7 @@ impl BashEmulator {
         program: &str,
         arguments: &[String],
         input: Vec<String>,
+        causes: Vec<CausalEntity>,
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<CommandOutput, BashError> {
@@ -742,16 +823,20 @@ impl BashEmulator {
             depth: depth + 1,
             stdin: input,
             current_directory: self.runtime.current_directory.clone(),
+            causes,
         };
         match host.process_request(intent)? {
             Some(ProcessResult {
                 stdout,
                 stderr,
                 exit_code,
+                causes,
             }) => Ok(CommandOutput {
                 stdout,
+                raw_stdout: None,
                 stderr,
                 code: exit_code,
+                causes,
             }),
             None => Ok(CommandOutput {
                 stderr: vec![format!("bash: {program}: command not found")],

@@ -1,7 +1,7 @@
 use crate::ast::Word;
 use crate::parser::ParsedDocument;
 use crate::{BashEmulator, BashError};
-use emulator_core::Host;
+use emulator_core::{Engine, EventKind, Host, TraceEvent};
 
 impl BashEmulator {
     pub(crate) fn expand_word_values(
@@ -25,6 +25,98 @@ impl BashEmulator {
                 .parse()
                 .unwrap_or(0)
         })
+    }
+
+    pub(crate) fn execute_arithmetic_statement(
+        &mut self,
+        expression: &str,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> i64 {
+        let mut value = 0;
+        for statement in split_arithmetic_statements(expression) {
+            let statement = statement.trim();
+            if statement.is_empty() {
+                continue;
+            }
+            if let Some(name) = statement.strip_suffix("++").map(str::trim) {
+                value = self.update_arithmetic_variable(name, 1, host, depth);
+            } else if let Some(name) = statement.strip_suffix("--").map(str::trim) {
+                value = self.update_arithmetic_variable(name, -1, host, depth);
+            } else if let Some(name) = statement.strip_prefix("++").map(str::trim) {
+                value = self.update_arithmetic_variable(name, 1, host, depth);
+            } else if let Some(name) = statement.strip_prefix("--").map(str::trim) {
+                value = self.update_arithmetic_variable(name, -1, host, depth);
+            } else if let Some((name, operator, right)) = arithmetic_assignment(statement) {
+                let right = self.evaluate_arithmetic_expression(right, host);
+                let current = self.evaluate_arithmetic_expression(name, host);
+                value = match operator {
+                    "+=" => current.wrapping_add(right),
+                    "-=" => current.wrapping_sub(right),
+                    "*=" => current.wrapping_mul(right),
+                    "/=" => {
+                        if right == 0 {
+                            0
+                        } else {
+                            current / right
+                        }
+                    }
+                    "%=" => {
+                        if right == 0 {
+                            0
+                        } else {
+                            current % right
+                        }
+                    }
+                    _ => right,
+                };
+                self.assign_arithmetic_variable(name, value, host, depth);
+            } else {
+                value = self.evaluate_arithmetic_expression(statement, host);
+            }
+        }
+        value
+    }
+
+    fn update_arithmetic_variable(
+        &mut self,
+        name: &str,
+        delta: i64,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> i64 {
+        let value = self
+            .evaluate_arithmetic_expression(name, host)
+            .wrapping_add(delta);
+        self.assign_arithmetic_variable(name, value, host, depth);
+        value
+    }
+
+    fn assign_arithmetic_variable(
+        &mut self,
+        name: &str,
+        value: i64,
+        host: &mut dyn Host,
+        depth: usize,
+    ) {
+        let name = name.trim();
+        if !is_arithmetic_variable(name) {
+            return;
+        }
+        let value = value.to_string();
+        self.runtime.variables.insert(name.into(), value.clone());
+        if self.runtime.exported.contains(name) {
+            host.set_environment(name, &value);
+        }
+        host.emit(
+            TraceEvent::new(
+                depth,
+                Engine::Bash,
+                EventKind::VariableAssignment,
+                format!("assigned arithmetic shell variable {name}"),
+            )
+            .with_data("value", value),
+        );
     }
 
     fn expand_braces(value: &str, limit: usize) -> Vec<String> {
@@ -315,7 +407,7 @@ fn balanced_substitution(source: &str) -> Option<(&str, usize)> {
 }
 
 fn evaluate_arithmetic(expression: &str, variable: impl Fn(&str) -> i64) -> i64 {
-    ArithmeticParser::new(expression, variable).parse_expression()
+    ArithmeticParser::new(expression, variable).parse_logical_or()
 }
 
 struct ArithmeticParser<'a, F> {
@@ -331,6 +423,59 @@ impl<'a, F: Fn(&str) -> i64> ArithmeticParser<'a, F> {
             offset: 0,
             variable,
         }
+    }
+
+    fn parse_logical_or(&mut self) -> i64 {
+        let mut value = self.parse_logical_and();
+        while self.consume_str("||") {
+            let right = self.parse_logical_and();
+            value = i64::from(value != 0 || right != 0);
+        }
+        value
+    }
+
+    fn parse_logical_and(&mut self) -> i64 {
+        let mut value = self.parse_comparison();
+        while self.consume_str("&&") {
+            let right = self.parse_comparison();
+            value = i64::from(value != 0 && right != 0);
+        }
+        value
+    }
+
+    fn parse_comparison(&mut self) -> i64 {
+        let mut value = self.parse_expression();
+        loop {
+            let comparison = if self.consume_str("==") {
+                Some("==")
+            } else if self.consume_str("!=") {
+                Some("!=")
+            } else if self.consume_str("<=") {
+                Some("<=")
+            } else if self.consume_str(">=") {
+                Some(">=")
+            } else if self.consume('<') {
+                Some("<")
+            } else if self.consume('>') {
+                Some(">")
+            } else {
+                None
+            };
+            let Some(comparison) = comparison else {
+                break;
+            };
+            let right = self.parse_expression();
+            value = i64::from(match comparison {
+                "==" => value == right,
+                "!=" => value != right,
+                "<=" => value <= right,
+                ">=" => value >= right,
+                "<" => value < right,
+                ">" => value > right,
+                _ => false,
+            });
+        }
+        value
     }
 
     fn parse_expression(&mut self) -> i64 {
@@ -370,9 +515,15 @@ impl<'a, F: Fn(&str) -> i64> ArithmeticParser<'a, F> {
     fn parse_factor(&mut self) -> i64 {
         self.skip_spaces();
         if self.consume('(') {
-            let value = self.parse_expression();
+            let value = self.parse_logical_or();
             self.consume(')');
             return value;
+        }
+        if self.consume('!') {
+            return i64::from(self.parse_factor() == 0);
+        }
+        if self.consume('+') {
+            return self.parse_factor();
         }
         if self.consume('-') {
             return self.parse_factor().wrapping_neg();
@@ -403,10 +554,84 @@ impl<'a, F: Fn(&str) -> i64> ArithmeticParser<'a, F> {
         }
     }
 
+    fn consume_str(&mut self, expected: &str) -> bool {
+        self.skip_spaces();
+        if self.source[self.offset..].starts_with(expected) {
+            self.offset += expected.len();
+            true
+        } else {
+            false
+        }
+    }
+
     fn current(&self) -> char {
         self.source[self.offset..]
             .chars()
             .next()
             .expect("arithmetic offset is in source")
     }
+}
+
+fn split_arithmetic_statements(expression: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0_usize;
+    let mut start = 0_usize;
+    for (offset, character) in expression.char_indices() {
+        match character {
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                parts.push(&expression[start..offset]);
+                start = offset + character.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    parts.push(&expression[start..]);
+    parts
+}
+
+fn arithmetic_assignment(expression: &str) -> Option<(&str, &str, &str)> {
+    let bytes = expression.as_bytes();
+    let mut depth = 0_usize;
+    let mut index = 0_usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            _ if depth == 0 => {
+                for operator in ["+=", "-=", "*=", "/=", "%=", "="] {
+                    if expression[index..].starts_with(operator) {
+                        if operator == "="
+                            && (bytes
+                                .get(index.wrapping_sub(1))
+                                .is_some_and(|byte| matches!(byte, b'!' | b'<' | b'>' | b'='))
+                                || bytes.get(index + 1) == Some(&b'='))
+                        {
+                            continue;
+                        }
+                        let name = expression[..index].trim();
+                        if is_arithmetic_variable(name) {
+                            return Some((
+                                name,
+                                operator,
+                                expression[index + operator.len()..].trim(),
+                            ));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn is_arithmetic_variable(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().enumerate().all(|(index, character)| {
+            character == '_'
+                || character.is_ascii_alphanumeric() && (index > 0 || !character.is_ascii_digit())
+        })
 }

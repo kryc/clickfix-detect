@@ -27,8 +27,8 @@ mod value;
 pub mod tokenizer;
 
 use emulator_core::{
-    sha256_hex, ArtifactKind, Engine, EventKind, Host, HostError, NetworkIntent, NetworkRequest,
-    ProcessIntent, ProcessResult, TraceEvent,
+    sha256_hex, ArtifactKind, CausalEntity, CausalRelation, Engine, EventKind, Host, HostError,
+    NetworkIntent, NetworkRequest, ProcessIntent, ProcessResult, TraceEvent,
 };
 use parser::ParsedSource;
 use regex::Regex;
@@ -212,6 +212,11 @@ impl PowerShellEmulator {
 
     pub fn drain_stdout(&mut self) -> Vec<String> {
         std::mem::take(&mut self.stdout)
+    }
+
+    #[must_use]
+    pub fn drain_stderr(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.error_output)
     }
 
     /// Parse and emulate a `PowerShell` script against the supplied virtual host.

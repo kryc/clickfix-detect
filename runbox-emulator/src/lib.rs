@@ -229,6 +229,7 @@ impl Runbox {
             depth,
             stdin: Vec::new(),
             current_directory: String::new(),
+            causes: Vec::new(),
         };
         self.dispatch_process(&intent)
     }
@@ -248,6 +249,9 @@ impl Runbox {
             .with_data("origin", &intent.origin)
             .with_data("command_line", limited(&intent.command_line, 2_048)),
         );
+        if self.block_virtual_binary_execution(intent) {
+            return Ok(());
+        }
         if let Some(result) = self.dispatch_extended_utility(&program, intent) {
             return result;
         }
@@ -347,6 +351,62 @@ impl Runbox {
             }
         }
     }
+
+    fn block_virtual_binary_execution(&mut self, intent: &ProcessIntent) -> bool {
+        let Some(path) = self.virtual_program_path(intent) else {
+            return false;
+        };
+        if self
+            .host
+            .inspect_virtual_binary(&path, Engine::Runbox, intent.depth)
+            .is_none()
+        {
+            return false;
+        }
+        self.record_urls(
+            &intent.command_line,
+            &format!("attempted virtual binary execution {path}"),
+            intent.depth,
+        );
+        self.host.unsupported(
+            Engine::Runbox,
+            intent.depth,
+            &format!(
+                "unsupported executable: native binary execution intentionally not performed: {path}"
+            ),
+        );
+        true
+    }
+
+    fn virtual_program_path(&self, intent: &ProcessIntent) -> Option<String> {
+        if self.host.virtual_file(&intent.program).is_some() {
+            return Some(intent.program.clone());
+        }
+        if intent.current_directory.is_empty() || is_absolute_path(&intent.program) {
+            return None;
+        }
+        let separator = match self.host.platform() {
+            HostPlatform::Windows => '\\',
+            HostPlatform::MacOs | HostPlatform::Linux => '/',
+        };
+        let candidate = format!(
+            "{}{separator}{}",
+            intent.current_directory.trim_end_matches(['/', '\\']),
+            intent.program
+        );
+        self.host
+            .virtual_file(&candidate)
+            .is_some()
+            .then_some(candidate)
+    }
+}
+
+fn is_absolute_path(path: &str) -> bool {
+    path.starts_with(['/', '\\'])
+        || path
+            .as_bytes()
+            .get(1)
+            .is_some_and(|separator| *separator == b':')
 }
 
 #[cfg(test)]

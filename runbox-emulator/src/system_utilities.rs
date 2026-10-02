@@ -264,7 +264,7 @@ impl Runbox {
                 depth,
             });
             if let Some(response) = response {
-                self.host.add_artifact(
+                self.add_network_artifact(
                     ArtifactKind::Script,
                     "wmic-format.xsl",
                     "application/xml",

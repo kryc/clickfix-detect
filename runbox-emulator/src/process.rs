@@ -1,6 +1,7 @@
 use emulator_core::{
-    AnalysisLimits, ArtifactKind, Engine, EventKind, Host, HostError, Ioc, NetworkIntent,
-    NetworkRequest, NetworkResponse, ProcessIntent, ProcessResult, TraceEvent,
+    AnalysisLimits, ArtifactKind, CausalEdge, CausalEntity, CausalRelation, Engine, EventKind,
+    Host, HostError, Ioc, NetworkIntent, NetworkRequest, NetworkResponse, ProcessIntent,
+    ProcessResult, TraceEvent,
 };
 
 use crate::command_line::quote_argument;
@@ -26,6 +27,7 @@ impl Runbox {
             depth: depth + 1,
             stdin: Vec::new(),
             current_directory: String::new(),
+            causes: Vec::new(),
         })?;
         Ok(())
     }
@@ -51,6 +53,10 @@ impl Host for Runbox {
 
     fn add_ioc(&mut self, ioc: Ioc) {
         self.host.add_ioc(ioc);
+    }
+
+    fn add_causal_edge(&mut self, edge: CausalEdge) {
+        self.host.add_causal_edge(edge);
     }
 
     fn add_artifact(
@@ -182,6 +188,10 @@ impl Host for Runbox {
         self.host.network_request_detailed(request)
     }
 
+    fn latest_network_activity_id(&self) -> Option<usize> {
+        self.host.latest_network_activity_id()
+    }
+
     fn process_intent(&mut self, intent: ProcessIntent) -> Result<(), HostError> {
         self.host.process_intent(intent)
     }
@@ -192,12 +202,44 @@ impl Host for Runbox {
     ) -> Result<Option<ProcessResult>, HostError> {
         self.host.record_process_request(&intent)?;
         let trace_start = self.host.snapshot().trace.len();
+        let network_start = self.host.snapshot().network_activity.len();
+        let artifact_start = self.host.snapshot().artifacts.len();
         let mut result = ProcessResult::default();
         if let Err(error) = self.dispatch_process(&intent) {
             result.exit_code = 1;
             result.stderr.push(error.to_string());
         }
         let snapshot = self.host.snapshot();
+        let process = CausalEntity::Process {
+            command_line: intent.command_line.clone(),
+        };
+        for id in network_start + 1..=snapshot.network_activity.len() {
+            self.host.add_causal_edge(CausalEdge {
+                from: CausalEntity::NetworkActivity { id },
+                to: process.clone(),
+                relation: CausalRelation::Derived,
+                depth: intent.depth,
+            });
+        }
+        for id in artifact_start + 1..=snapshot.artifacts.len() {
+            self.host.add_causal_edge(CausalEdge {
+                from: process.clone(),
+                to: CausalEntity::Artifact { id },
+                relation: CausalRelation::Derived,
+                depth: intent.depth,
+            });
+        }
+        result.causes.extend(intent.causes);
+        result.causes.extend(
+            (network_start + 1..=snapshot.network_activity.len())
+                .map(|id| emulator_core::CausalEntity::NetworkActivity { id }),
+        );
+        result.causes.extend(
+            (artifact_start + 1..=snapshot.artifacts.len())
+                .map(|id| emulator_core::CausalEntity::Artifact { id }),
+        );
+        result.causes.sort();
+        result.causes.dedup();
         for event in snapshot.trace.iter().skip(trace_start) {
             if let Some(exit_code) = event
                 .data

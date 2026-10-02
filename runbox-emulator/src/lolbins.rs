@@ -1,6 +1,7 @@
 use base64::Engine as _;
 use emulator_core::{
-    ArtifactKind, Engine, EventKind, Host, NetworkIntent, ProcessIntent, TraceEvent,
+    ArtifactKind, CausalEntity, CausalRelation, Engine, EventKind, Host, NetworkIntent,
+    ProcessIntent, TraceEvent,
 };
 use windows_script_emulator::ScriptLanguage;
 
@@ -75,8 +76,17 @@ impl Runbox {
                     decode_hex(&text)
                 };
                 if let Some(decoded) = decoded {
-                    self.host
-                        .write_file(destination, &decoded, false, Engine::Cmd, depth)?;
+                    self.host.write_file_from(
+                        destination,
+                        &decoded,
+                        false,
+                        Engine::Cmd,
+                        depth,
+                        &[CausalEntity::VirtualFile {
+                            path: source.clone(),
+                        }],
+                        CausalRelation::Decoded,
+                    )?;
                     self.host.emit(
                         TraceEvent::new(
                             depth,
@@ -139,8 +149,32 @@ impl Runbox {
         });
         if let Some(response) = response {
             if let Some(output) = output {
-                self.host
-                    .write_file(&output, &response.body, false, Engine::Runbox, depth)?;
+                self.write_network_file(&output, &response.body, Engine::Runbox, depth)?;
+            } else if let Some(pipe) = arguments.iter().position(|argument| argument == "|") {
+                let mut nested = arguments[pipe + 1..].iter();
+                let program = nested
+                    .find(|argument| !argument.contains('='))
+                    .cloned()
+                    .unwrap_or_default();
+                if !program.is_empty() {
+                    let args = nested.cloned().collect::<Vec<_>>();
+                    self.host.process_intent(ProcessIntent {
+                        program: program.clone(),
+                        args: args.clone(),
+                        command_line: std::iter::once(program.clone())
+                            .chain(args.iter().cloned())
+                            .collect::<Vec<_>>()
+                            .join(" "),
+                        origin: format!("runbox {program} pipeline"),
+                        depth: depth + 1,
+                        stdin: String::from_utf8_lossy(&response.body)
+                            .lines()
+                            .map(str::to_owned)
+                            .collect(),
+                        current_directory: String::new(),
+                        causes: self.latest_network_source(),
+                    })?;
+                }
             } else {
                 for line in String::from_utf8_lossy(&response.body).lines() {
                     self.host.emit(
@@ -172,12 +206,15 @@ impl Runbox {
                 if let Some(destination) = arguments.last().filter(|value| {
                     !value.starts_with('/') && !value.to_ascii_lowercase().starts_with("http")
                 }) {
-                    self.host.write_file(
+                    let sources = self.latest_network_source();
+                    self.host.write_file_from(
                         destination,
                         &response.body,
                         false,
                         Engine::Runbox,
                         depth,
+                        &sources,
+                        CausalRelation::Downloaded,
                     )?;
                 }
             }

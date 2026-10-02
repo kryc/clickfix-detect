@@ -1,5 +1,5 @@
 use crate::archives::extract_zip;
-use crate::syntax::normalize_variable;
+use crate::syntax::{normalize_variable, split_windows_command_line};
 use crate::{PowerShellEmulator, PowerShellError, Value};
 use emulator_core::{windows::classify_com_progid, Engine, Host, NetworkIntent};
 use std::collections::BTreeMap;
@@ -49,18 +49,15 @@ impl PowerShellEmulator {
         let value = match (com_type.to_ascii_lowercase().as_str(), method.as_str()) {
             ("wscript.shell", "run" | "exec") => {
                 let command = args.first().map_or_else(String::new, Value::as_string);
-                Self::spawn_command_line(&command, "PowerShell WScript.Shell", host, depth)?;
-                Value::Map(
-                    [
-                        ("__type".into(), Value::String("ComResult:Exec".into())),
-                        ("ExitCode".into(), Value::Number(0)),
-                        ("Status".into(), Value::Number(1)),
-                        ("StdOut".into(), Value::String(String::new())),
-                        ("StdErr".into(), Value::String(String::new())),
-                    ]
-                    .into_iter()
-                    .collect(),
-                )
+                match Self::request_command_line(&command, "PowerShell WScript.Shell", host, depth)?
+                {
+                    Some(result) if method == "run" => {
+                        self.record_process_status(&result, host, depth);
+                        Value::Number(i64::from(result.exit_code))
+                    }
+                    Some(result) => self.process_result_object(&result, host, depth),
+                    None => Value::Object("BlockedProcess".into()),
+                }
             }
             ("wscript.shell", "regread") => {
                 let path = args.first().map_or_else(String::new, Value::as_string);
@@ -118,12 +115,15 @@ impl PowerShellEmulator {
             ("shell.application", "shellexecute") => {
                 let program = args.first().map_or_else(String::new, Value::as_string);
                 let command_args = args.get(1).map_or_else(String::new, Value::as_string);
-                Self::spawn_command_line(
-                    &format!("{program} {command_args}"),
+                if let Some(result) = Self::request_process(
+                    &program,
+                    split_windows_command_line(&command_args),
                     "PowerShell Shell.Application",
                     host,
                     depth,
-                )?;
+                )? {
+                    self.record_process_status(&result, host, depth);
+                }
                 Value::Null
             }
             ("shell.application", "namespace") => Value::Map(

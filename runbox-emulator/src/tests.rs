@@ -1,9 +1,37 @@
 use std::collections::BTreeMap;
 
 use base64::Engine as _;
-use emulator_core::{AnalysisLimits, Engine, EventKind, Host, NetworkResponse};
+use emulator_core::{
+    AnalysisLimits, BinaryFormat, CausalRelation, Engine, EventKind, Host, NetworkResponse,
+};
+use powershell_emulator::PowerShellEmulator;
 
 use crate::{Runbox, RunboxInput};
+
+fn minimal_elf64() -> Vec<u8> {
+    let mut bytes = vec![0_u8; 120];
+    bytes[0..4].copy_from_slice(b"\x7fELF");
+    bytes[4] = 2;
+    bytes[5] = 1;
+    bytes[6] = 1;
+    bytes[16..18].copy_from_slice(&2_u16.to_le_bytes());
+    bytes[18..20].copy_from_slice(&62_u16.to_le_bytes());
+    bytes[20..24].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[24..32].copy_from_slice(&0x0040_0078_u64.to_le_bytes());
+    bytes[32..40].copy_from_slice(&64_u64.to_le_bytes());
+    bytes[52..54].copy_from_slice(&64_u16.to_le_bytes());
+    bytes[54..56].copy_from_slice(&56_u16.to_le_bytes());
+    bytes[56..58].copy_from_slice(&1_u16.to_le_bytes());
+    bytes[58..60].copy_from_slice(&64_u16.to_le_bytes());
+    bytes[64..68].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&5_u32.to_le_bytes());
+    bytes[80..88].copy_from_slice(&0x0040_0000_u64.to_le_bytes());
+    bytes[88..96].copy_from_slice(&0x0040_0000_u64.to_le_bytes());
+    bytes[96..104].copy_from_slice(&120_u64.to_le_bytes());
+    bytes[104..112].copy_from_slice(&120_u64.to_le_bytes());
+    bytes[112..120].copy_from_slice(&0x1000_u64.to_le_bytes());
+    bytes
+}
 
 #[test]
 fn dispatches_encoded_powershell_without_host_execution() {
@@ -31,6 +59,71 @@ fn dispatches_encoded_powershell_without_host_execution() {
         .artifacts
         .iter()
         .any(|artifact| artifact.name == "encoded-command.ps1"));
+}
+
+#[test]
+fn attempted_native_execution_is_inspected_but_never_run() {
+    let mut runbox = Runbox::new_linux(AnalysisLimits::default());
+    runbox
+        .host_mut()
+        .write_file("/tmp/curl", &minimal_elf64(), false, Engine::Runbox, 0)
+        .unwrap();
+    runbox
+        .host_mut()
+        .register_executable("/tmp/curl", Engine::Runbox, 0)
+        .unwrap();
+
+    let result = runbox
+        .emulate(RunboxInput::LinuxShellScript("/tmp/curl".into()))
+        .unwrap();
+
+    assert_eq!(result.snapshot.binary_inspections.len(), 1);
+    assert!(result.snapshot.trace.iter().any(|event| {
+        event.kind == EventKind::Unsupported
+            && event
+                .message
+                .contains("native binary execution intentionally not performed")
+    }));
+}
+
+#[test]
+fn powershell_process_launch_surfaces_return_synchronous_output() {
+    let mut runbox = Runbox::default();
+    let mut emulator = PowerShellEmulator::new();
+
+    emulator
+        .emulate(
+            r"
+& 'cmd.exe' '/c' 'echo invocation-output'
+$started = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c echo start-output'
+Write-Output $started.StandardOutput
+$dotnet = [Diagnostics.Process]::Start('cmd.exe', '/c echo dotnet-output')
+Write-Output $dotnet.StandardOutput
+",
+            &mut runbox,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(
+        emulator.drain_stdout(),
+        ["invocation-output", "start-output", "dotnet-output"]
+    );
+}
+
+#[test]
+fn powershell_parent_retains_native_cmd_stderr() {
+    let mut runbox = Runbox::default();
+    let mut emulator = PowerShellEmulator::new();
+
+    emulator
+        .emulate(r"cmd.exe /c type C:\missing.txt", &mut runbox, 0)
+        .unwrap();
+
+    assert!(emulator
+        .drain_stderr()
+        .iter()
+        .any(|line| line.contains("cannot find the file")));
 }
 
 #[test]
@@ -651,6 +744,40 @@ fn tar_create_and_extract_round_trip_virtual_files() {
 }
 
 #[test]
+fn archive_extraction_inspects_binary_entries_and_records_provenance() {
+    let mut runbox = Runbox::default();
+    runbox
+        .host_mut()
+        .write_file(
+            r"C:\Temp\payload.exe",
+            &minimal_elf64(),
+            false,
+            Engine::Runbox,
+            0,
+        )
+        .unwrap();
+
+    let result = runbox
+        .emulate(RunboxInput::RawCommand(
+            r#"cmd.exe /c "tar.exe -cf C:\Temp\payload.tar C:\Temp\payload.exe && tar.exe -xf C:\Temp\payload.tar -C C:\Extracted""#
+                .into(),
+        ))
+        .unwrap();
+
+    assert!(result.snapshot.binary_inspections.iter().any(|record| {
+        record
+            .sources
+            .iter()
+            .any(|source| source.name.ends_with(r"\extracted\payload.exe"))
+    }));
+    assert!(result
+        .snapshot
+        .causal_edges
+        .iter()
+        .any(|edge| edge.relation == CausalRelation::Extracted));
+}
+
+#[test]
 fn msbuild_exec_tasks_dispatch_child_commands() {
     let mut runbox = Runbox::default();
     runbox
@@ -767,8 +894,15 @@ fn installutil_and_control_only_inspect_virtual_pe_files() {
             r"installutil.exe C:\Temp\safe.dll".into(),
         ))
         .unwrap();
+    assert!(first.snapshot.binary_inspections.iter().any(|record| {
+        record.inspection.format == BinaryFormat::Pe
+            && record
+                .sources
+                .iter()
+                .any(|source| source.name.ends_with("safe.dll"))
+    }));
     assert!(first.snapshot.trace.iter().any(|event| {
-        event.kind == EventKind::Parse && event.message.contains("statically inspected PE")
+        event.kind == EventKind::Parse && event.message.contains("binary inspection")
     }));
 
     let second = runbox

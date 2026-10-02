@@ -189,6 +189,7 @@ impl PowerShellEmulator {
                         depth: depth + 1,
                         stdin: Vec::new(),
                         current_directory: self.current_location.clone(),
+                        causes: Vec::new(),
                     })?;
                     Some(Value::Object("BlockedShellAssociation".into()))
                 } else {

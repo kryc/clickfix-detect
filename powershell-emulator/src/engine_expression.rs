@@ -684,14 +684,18 @@ impl PowerShellEmulator {
                 let command_args = args.get(1).map_or_else(Vec::new, |value| {
                     split_windows_command_line(&value.as_string())
                 });
-                Self::spawn(
-                    &program,
-                    command_args,
-                    "PowerShell Process.Start",
-                    host,
-                    depth,
-                )?;
-                Ok(Value::Object("BlockedProcess".into()))
+                Ok(
+                    match Self::request_process(
+                        &program,
+                        command_args,
+                        "PowerShell Process.Start",
+                        host,
+                        depth,
+                    )? {
+                        Some(result) => self.process_result_object(&result, host, depth),
+                        None => Value::Object("BlockedProcess".into()),
+                    },
+                )
             }
             _ => {
                 host.unsupported(
