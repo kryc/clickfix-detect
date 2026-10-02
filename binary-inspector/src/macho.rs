@@ -1,6 +1,6 @@
 use crate::{
-    heuristics, BinaryHardening, BinaryImport, BinaryInspection, BinaryInspectionLimits,
-    BinaryKind, BinarySection, InspectionStatus,
+    heuristics, signatures, BinaryHardening, BinaryImport, BinaryInspection,
+    BinaryInspectionLimits, BinaryKind, BinarySection, InspectionStatus,
 };
 use goblin::mach::{
     constants::{cputype::get_arch_name_from_types, VM_PROT_EXECUTE, VM_PROT_READ, VM_PROT_WRITE},
@@ -49,9 +49,11 @@ pub(crate) fn inspect(
                 overlay_bytes: 0,
                 certificate_count: 0,
                 signature_bytes: None,
+                signature_validation: None,
                 entitlement_keys: Vec::new(),
                 packer_markers: Vec::new(),
                 high_entropy_sections: Vec::new(),
+                gnu_properties: Vec::new(),
                 capabilities: Vec::new(),
                 indicators: Vec::new(),
                 warnings: Vec::new(),
@@ -100,6 +102,10 @@ pub(crate) fn inspect(
             inspection.packer_markers = heuristics::packer_markers(bytes, &inspection.sections);
             inspection.high_entropy_sections =
                 heuristics::high_entropy_sections(&inspection.sections);
+            inspection.signature_validation = Some(signatures::validate_macho(
+                bytes,
+                inspection.signature_bytes.is_some(),
+            ));
             inspection
         }
     }
@@ -159,9 +165,11 @@ fn inspect_thin(
         overlay_bytes: 0,
         certificate_count: 0,
         signature_bytes: signature_bytes(binary),
+        signature_validation: None,
         entitlement_keys: heuristics::entitlement_keys(bytes, limits.max_entitlement_keys),
         packer_markers: Vec::new(),
         high_entropy_sections: Vec::new(),
+        gnu_properties: Vec::new(),
         capabilities: Vec::new(),
         indicators: Vec::new(),
         warnings: Vec::new(),
@@ -178,6 +186,10 @@ fn inspect_thin(
     );
     inspection.packer_markers = heuristics::packer_markers(bytes, &inspection.sections);
     inspection.high_entropy_sections = heuristics::high_entropy_sections(&inspection.sections);
+    inspection.signature_validation = Some(signatures::validate_macho(
+        bytes,
+        inspection.signature_bytes.is_some(),
+    ));
     inspection
 }
 

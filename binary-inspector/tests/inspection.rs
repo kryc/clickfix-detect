@@ -1,5 +1,6 @@
 use binary_inspector::{
     inspect, probe_format, BinaryFormat, BinaryInspectionLimits, BinaryKind, InspectionStatus,
+    SignatureValidationStatus,
 };
 
 #[test]
@@ -50,6 +51,10 @@ fn parses_minimal_macho64_executable() {
     assert_eq!(inspection.kind, BinaryKind::Executable);
     assert_eq!(inspection.architectures, ["x86_64"]);
     assert!(inspection.is_64_bit);
+    assert_eq!(
+        inspection.signature_validation.unwrap().status,
+        SignatureValidationStatus::NotPresent
+    );
 }
 
 #[test]
@@ -63,6 +68,10 @@ fn parses_minimal_pe64_executable() {
     assert_eq!(inspection.entry_point, Some(0x1000));
     assert!(inspection.is_64_bit);
     assert_eq!(inspection.sections[0].name, ".text");
+    assert_eq!(
+        inspection.signature_validation.unwrap().status,
+        SignatureValidationStatus::NotPresent
+    );
 }
 
 #[test]

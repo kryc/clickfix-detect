@@ -4,7 +4,9 @@ use base64::Engine as _;
 use emulator_core::{
     AnalysisLimits, BinaryFormat, CausalRelation, Engine, EventKind, Host, NetworkResponse,
 };
+use flate2::{write::GzEncoder, Compression};
 use powershell_emulator::PowerShellEmulator;
+use std::io::Write;
 
 use crate::{Runbox, RunboxInput};
 
@@ -1100,6 +1102,35 @@ fn macos_base64_pipeline_and_nohup_execute_shell_stdin() {
         "trace: {:#?}",
         result.snapshot.trace
     );
+}
+
+#[test]
+fn gzip_pipeline_executes_decompressed_shell_stdin() {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(b"echo gzip-stage\n").unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut runbox = Runbox::new_linux(AnalysisLimits::default());
+    runbox
+        .host_mut()
+        .write_file("/tmp/stage.gz", &compressed, false, Engine::Runbox, 0)
+        .unwrap();
+
+    let result = runbox
+        .emulate(RunboxInput::LinuxShellScript(
+            "cat /tmp/stage.gz | gzip -dc | zsh".into(),
+        ))
+        .unwrap();
+
+    assert!(result
+        .snapshot
+        .trace
+        .iter()
+        .any(|event| event.kind == EventKind::Output && event.message == "gzip-stage"));
+    assert!(result
+        .snapshot
+        .trace
+        .iter()
+        .any(|event| event.kind == EventKind::Decode && event.message.contains("GZip")));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use crate::{
-    heuristics, BinaryHardening, BinaryImport, BinaryInspection, BinaryInspectionLimits,
-    BinaryKind, BinarySection, InspectionStatus,
+    heuristics, signatures, BinaryHardening, BinaryImport, BinaryInspection,
+    BinaryInspectionLimits, BinaryKind, BinarySection, InspectionStatus,
 };
 use goblin::pe::{
     dll_characteristic::{
@@ -146,9 +146,14 @@ pub(crate) fn inspect(
         overlay_bytes,
         certificate_count: binary.certificates.len(),
         signature_bytes: (signature_bytes != 0).then_some(signature_bytes),
+        signature_validation: Some(signatures::validate_authenticode(
+            bytes,
+            binary.certificates.len(),
+        )),
         entitlement_keys: Vec::new(),
         packer_markers,
         high_entropy_sections,
+        gnu_properties: Vec::new(),
         capabilities: Vec::new(),
         indicators: Vec::new(),
         warnings,

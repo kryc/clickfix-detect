@@ -11,11 +11,29 @@ impl BashEmulator {
         host: &mut dyn Host,
         depth: usize,
     ) -> Result<Vec<String>, BashError> {
+        let raw = word
+            .fragments
+            .iter()
+            .map(|span| &document.source()[span.start..span.end])
+            .collect::<String>();
+        if raw.contains("=(") && raw.ends_with(')') {
+            return Ok(vec![self.expand_word(document, word, host, depth)?]);
+        }
+        if let Some(values) = self.expand_array_word(&raw, host) {
+            return Ok(values);
+        }
         let value = self.expand_word(document, word, host, depth)?;
-        Ok(Self::expand_braces(
-            &value,
-            host.limits().max_loop_iterations.max(1),
-        ))
+        let values = Self::expand_braces(&value, host.limits().max_loop_iterations.max(1));
+        if word_is_quoted(&raw) {
+            return Ok(values);
+        }
+        let mut expanded = Vec::new();
+        for value in values {
+            for field in self.split_fields(&value, host) {
+                expanded.extend(self.expand_glob(&field, host, depth));
+            }
+        }
+        Ok(expanded)
     }
 
     pub(crate) fn evaluate_arithmetic_expression(&self, expression: &str, host: &dyn Host) -> i64 {
@@ -209,20 +227,26 @@ impl BashEmulator {
                     .and_then(|value| value.strip_suffix('`'))
                     .unwrap_or_default();
                 output.push_str(&self.execute_substitution(command, host, depth + 1)?);
-            } else if fragment.starts_with("<(") || fragment.starts_with(">(") {
+            } else if fragment.starts_with("<(") {
                 let command = &fragment[2..fragment.len().saturating_sub(1)];
                 let content = self.execute_substitution(command, host, depth + 1)?;
                 self.runtime.temporary_file_counter += 1;
-                let path = format!(
-                    "/private/tmp/bash-process-{}",
-                    self.runtime.temporary_file_counter
-                );
+                let path = self.temporary_process_path(host);
                 let bytes = if content.is_empty() {
                     Vec::new()
                 } else {
                     format!("{content}\n").into_bytes()
                 };
                 host.write_file(&path, &bytes, false, emulator_core::Engine::Bash, depth)?;
+                output.push_str(&path);
+            } else if fragment.starts_with(">(") {
+                let command = &fragment[2..fragment.len().saturating_sub(1)];
+                self.runtime.temporary_file_counter += 1;
+                let path = self.temporary_process_path(host);
+                host.write_file(&path, &[], false, emulator_core::Engine::Bash, depth)?;
+                self.runtime
+                    .output_process_substitutions
+                    .insert(path.clone(), command.into());
                 output.push_str(&path);
             } else {
                 output.push_str(&self.expand_text(fragment, host, depth)?);
@@ -335,6 +359,16 @@ impl BashEmulator {
         depth: usize,
     ) -> Result<String, BashError> {
         if let Some(name) = expression.strip_prefix('#') {
+            if let Some((name, index)) = array_reference(name) {
+                if matches!(index, "@" | "*") {
+                    return Ok(self
+                        .runtime
+                        .arrays
+                        .get(name)
+                        .map_or(0, Vec::len)
+                        .to_string());
+                }
+            }
             return Ok(self
                 .runtime
                 .variable(name, host.environment(name))
@@ -371,6 +405,136 @@ impl BashEmulator {
             .runtime
             .variable(expression, host.environment(expression)))
     }
+
+    fn expand_array_word(&self, raw: &str, host: &dyn Host) -> Option<Vec<String>> {
+        let (quoted, expression) = strip_outer_quotes(raw);
+        let expression = expression.strip_prefix("${")?.strip_suffix('}')?;
+        let (name, index) = array_reference(expression)?;
+        let values = self.runtime.arrays.get(name).cloned().unwrap_or_default();
+        match index {
+            "@" => Some(values),
+            "*" => {
+                let separator = self.ifs(host).chars().next().unwrap_or(' ');
+                Some(vec![values.join(&separator.to_string())])
+            }
+            index => Some(vec![index
+                .parse::<usize>()
+                .ok()
+                .and_then(|index| values.get(index))
+                .cloned()
+                .unwrap_or_default()])
+            .filter(|_| quoted || !values.is_empty()),
+        }
+    }
+
+    fn split_fields(&self, value: &str, host: &dyn Host) -> Vec<String> {
+        let Some(ifs) = self.ifs_value(host) else {
+            return vec![value.into()];
+        };
+        if ifs.is_empty() {
+            return vec![value.into()];
+        }
+        value
+            .split(|character| ifs.contains(character))
+            .filter(|field| !field.is_empty())
+            .map(str::to_owned)
+            .collect()
+    }
+
+    fn expand_glob(&self, pattern: &str, host: &mut dyn Host, depth: usize) -> Vec<String> {
+        if !pattern.contains(['*', '?']) {
+            return vec![pattern.into()];
+        }
+        let (parent, name_pattern, absolute) = match pattern.rsplit_once('/') {
+            Some(("", name)) => ("/".into(), name, true),
+            Some((parent, name)) => (self.runtime.resolve_path(parent), name, true),
+            None => (self.runtime.current_directory.clone(), pattern, false),
+        };
+        let include_hidden = name_pattern.starts_with('.');
+        let mut matches = host
+            .list_files(&parent, Engine::Bash, depth)
+            .into_iter()
+            .chain(host.list_directories(&parent, Engine::Bash, depth))
+            .filter_map(|candidate| {
+                let name = direct_child_name(&parent, &candidate)?.to_owned();
+                if !include_hidden && name.starts_with('.') {
+                    return None;
+                }
+                crate::shell_pattern_matches(&name, name_pattern).then_some({
+                    if absolute {
+                        candidate
+                    } else {
+                        name
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        matches.sort();
+        matches.dedup();
+        if matches.is_empty() {
+            vec![pattern.into()]
+        } else {
+            matches
+        }
+    }
+
+    fn ifs(&self, host: &dyn Host) -> String {
+        self.ifs_value(host).unwrap_or_else(|| " \t\n".into())
+    }
+
+    fn ifs_value(&self, host: &dyn Host) -> Option<String> {
+        self.runtime
+            .variables
+            .get("IFS")
+            .cloned()
+            .or_else(|| host.environment("IFS").map(str::to_owned))
+            .or_else(|| Some(" \t\n".into()))
+    }
+
+    fn temporary_process_path(&self, host: &dyn Host) -> String {
+        let directory = host.environment("TMPDIR").unwrap_or("/tmp");
+        format!(
+            "{}/bash-process-{}",
+            directory.trim_end_matches('/'),
+            self.runtime.temporary_file_counter
+        )
+    }
+}
+
+fn strip_outer_quotes(value: &str) -> (bool, &str) {
+    if let Some(value) = value
+        .strip_prefix('"')
+        .and_then(|value| value.strip_suffix('"'))
+        .or_else(|| {
+            value
+                .strip_prefix('\'')
+                .and_then(|value| value.strip_suffix('\''))
+        })
+    {
+        (true, value)
+    } else {
+        (false, value)
+    }
+}
+
+fn word_is_quoted(value: &str) -> bool {
+    matches!(value.chars().next(), Some('\'' | '"'))
+}
+
+fn array_reference(name: &str) -> Option<(&str, &str)> {
+    let open = name.find('[')?;
+    let close = name.strip_suffix(']')?;
+    Some((&name[..open], &close[open + 1..]))
+}
+
+fn direct_child_name<'a>(parent: &str, candidate: &'a str) -> Option<&'a str> {
+    let prefix = if parent == "/" {
+        "/".into()
+    } else {
+        format!("{}/", parent.trim_end_matches('/'))
+    };
+    let rest = candidate.strip_prefix(&prefix)?;
+    (!rest.is_empty() && !rest.contains('/')).then_some(rest)
 }
 
 fn balanced_substitution(source: &str) -> Option<(&str, usize)> {

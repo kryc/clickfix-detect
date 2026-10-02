@@ -28,6 +28,33 @@ pub enum InspectionStatus {
     Partial,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignatureValidationStatus {
+    NotPresent,
+    IntegrityValid,
+    CryptographicallyValid,
+    Invalid,
+    Unsupported,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureValidation {
+    pub status: SignatureValidationStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub algorithm: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_digest_valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cryptographic_signature_valid: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub certificate_chain_valid: Option<bool>,
+    pub signer_count: usize,
+    pub certificate_count: usize,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub issues: Vec<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BinarySection {
     pub name: String,
@@ -123,12 +150,16 @@ pub struct BinaryInspection {
     pub certificate_count: usize,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub signature_bytes: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature_validation: Option<SignatureValidation>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub entitlement_keys: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub packer_markers: Vec<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub high_entropy_sections: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub gnu_properties: Vec<String>,
     pub capabilities: Vec<BinaryCapability>,
     pub indicators: Vec<BinaryIndicator>,
     pub warnings: Vec<String>,
@@ -166,9 +197,11 @@ impl BinaryInspection {
             overlay_bytes: 0,
             certificate_count: 0,
             signature_bytes: None,
+            signature_validation: None,
             entitlement_keys: Vec::new(),
             packer_markers: Vec::new(),
             high_entropy_sections: Vec::new(),
+            gnu_properties: Vec::new(),
             capabilities: Vec::new(),
             indicators: Vec::new(),
             warnings: vec![warning],

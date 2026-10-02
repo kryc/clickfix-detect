@@ -8,6 +8,19 @@ pub(crate) struct NetworkFetch {
     pub redirects: Vec<String>,
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Clone)]
+struct PinnedResolver {
+    addresses: Vec<std::net::SocketAddr>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl ureq::Resolver for PinnedResolver {
+    fn resolve(&self, _netloc: &str) -> std::io::Result<Vec<std::net::SocketAddr>> {
+        Ok(self.addresses.clone())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPolicy {
     pub enabled: bool,
@@ -52,20 +65,21 @@ pub(crate) fn send(
     if !policy.enabled {
         return Err("network access is disabled".into());
     }
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .timeout_connect(policy.timeout)
-        .timeout_read(policy.timeout)
-        .timeout_write(policy.timeout)
-        .try_proxy_from_env(false)
-        .build();
     let mut method = request.method.clone();
     let mut url = request.url.clone();
     let mut body = request.body.clone();
     let mut headers = request.headers.clone();
     let mut redirects = Vec::new();
     for redirect in 0..=policy.max_redirects {
-        validate_url(policy, &url)?;
+        let addresses = resolve_and_validate_url(policy, &url)?;
+        let agent = ureq::AgentBuilder::new()
+            .redirects(0)
+            .timeout_connect(policy.timeout)
+            .timeout_read(policy.timeout)
+            .timeout_write(policy.timeout)
+            .try_proxy_from_env(false)
+            .resolver(PinnedResolver { addresses })
+            .build();
         let mut outgoing = agent.request(&method, &url);
         for (name, value) in &headers {
             outgoing = outgoing.set(name, value);
@@ -165,7 +179,10 @@ fn same_origin(left: &str, right: &str) -> Result<bool, String> {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn validate_url(policy: &NetworkPolicy, value: &str) -> Result<(), String> {
+fn resolve_and_validate_url(
+    policy: &NetworkPolicy,
+    value: &str,
+) -> Result<Vec<std::net::SocketAddr>, String> {
     use std::net::ToSocketAddrs;
 
     use url::Url;
@@ -183,17 +200,24 @@ fn validate_url(policy: &NetworkPolicy, value: &str) -> Result<(), String> {
     let port = url
         .port_or_known_default()
         .ok_or_else(|| "network URL has no usable port".to_owned())?;
-    if policy.public_http_only {
-        let addresses = (host, port)
-            .to_socket_addrs()
-            .map_err(|error| format!("DNS resolution failed: {error}"))?
-            .collect::<Vec<_>>();
-        if addresses.is_empty() {
-            return Err("DNS resolution returned no addresses".into());
-        }
-        if addresses.iter().any(|address| !is_public_ip(address.ip())) {
-            return Err("network destination is not public".into());
-        }
+    let addresses = (host, port)
+        .to_socket_addrs()
+        .map_err(|error| format!("DNS resolution failed: {error}"))?
+        .collect::<Vec<_>>();
+    validate_resolved_addresses(policy, &addresses)?;
+    Ok(addresses)
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn validate_resolved_addresses(
+    policy: &NetworkPolicy,
+    addresses: &[std::net::SocketAddr],
+) -> Result<(), String> {
+    if addresses.is_empty() {
+        return Err("DNS resolution returned no addresses".into());
+    }
+    if policy.public_http_only && addresses.iter().any(|address| !is_public_ip(address.ip())) {
+        return Err("network destination is not public".into());
     }
     Ok(())
 }
@@ -277,5 +301,20 @@ mod tests {
         )
         .unwrap());
         assert!(same_origin("https://example.org/start", "https://xn--example-.org/next").is_err());
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn validated_address_set_is_the_connection_allowlist() {
+        let policy = NetworkPolicy::public_http();
+        assert!(validate_resolved_addresses(&policy, &["1.1.1.1:443".parse().unwrap()]).is_ok());
+        assert!(validate_resolved_addresses(
+            &policy,
+            &[
+                "1.1.1.1:443".parse().unwrap(),
+                "127.0.0.1:443".parse().unwrap()
+            ]
+        )
+        .is_err());
     }
 }

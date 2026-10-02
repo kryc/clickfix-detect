@@ -5,7 +5,7 @@ use crate::{
 use goblin::elf::{
     header::{ET_CORE, ET_DYN, ET_EXEC, ET_REL},
     note::NT_GNU_BUILD_ID,
-    program_header::{PF_X, PT_GNU_RELRO, PT_GNU_STACK},
+    program_header::{PF_R, PF_W, PF_X, PT_GNU_RELRO, PT_GNU_STACK, PT_LOAD},
     section_header::{SHF_ALLOC, SHF_EXECINSTR, SHF_WRITE},
     sym::STB_GLOBAL,
     Elf,
@@ -42,6 +42,7 @@ pub(crate) fn inspect(
         .any(|header| header.p_type == PT_GNU_RELRO);
     let mut warnings = truncation_warnings(binary, limits);
     let build_id = build_id(binary, bytes, &mut warnings);
+    let gnu_properties = gnu_properties(binary, bytes, &mut warnings);
     let mut runtime_paths = binary
         .runpaths
         .iter()
@@ -105,9 +106,11 @@ pub(crate) fn inspect(
         overlay_bytes,
         certificate_count: 0,
         signature_bytes: None,
+        signature_validation: None,
         entitlement_keys: Vec::new(),
         packer_markers,
         high_entropy_sections,
+        gnu_properties,
         capabilities: Vec::new(),
         indicators: Vec::new(),
         warnings,
@@ -116,7 +119,7 @@ pub(crate) fn inspect(
 }
 
 fn sections(binary: &Elf<'_>, bytes: &[u8], limit: usize) -> Vec<BinarySection> {
-    binary
+    let mut sections = binary
         .section_headers
         .iter()
         .take(limit)
@@ -146,7 +149,38 @@ fn sections(binary: &Elf<'_>, bytes: &[u8], limit: usize) -> Vec<BinarySection> 
                 entropy_milli_bits: heuristics::entropy_milli(data),
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    for (index, segment) in binary
+        .program_headers
+        .iter()
+        .filter(|segment| segment.p_type == PT_LOAD && segment.p_filesz != 0)
+        .enumerate()
+    {
+        if sections.len() >= limit {
+            break;
+        }
+        let data = usize::try_from(segment.p_offset)
+            .ok()
+            .and_then(|start| {
+                usize::try_from(segment.p_filesz)
+                    .ok()
+                    .and_then(|size| start.checked_add(size))
+                    .and_then(|end| bytes.get(start..end))
+            })
+            .unwrap_or_default();
+        sections.push(BinarySection {
+            name: format!("PT_LOAD[{index}]"),
+            virtual_address: segment.p_vaddr,
+            virtual_size: segment.p_memsz,
+            file_offset: segment.p_offset,
+            file_size: segment.p_filesz,
+            readable: segment.p_flags & PF_R != 0,
+            writable: segment.p_flags & PF_W != 0,
+            executable: segment.p_flags & PF_X != 0,
+            entropy_milli_bits: heuristics::entropy_milli(data),
+        });
+    }
+    sections
 }
 
 fn build_id(binary: &Elf<'_>, bytes: &[u8], warnings: &mut Vec<String>) -> Option<String> {
@@ -164,6 +198,87 @@ fn build_id(binary: &Elf<'_>, bytes: &[u8], warnings: &mut Vec<String>) -> Optio
         }
     }
     None
+}
+
+fn gnu_properties(binary: &Elf<'_>, bytes: &[u8], warnings: &mut Vec<String>) -> Vec<String> {
+    let Some(notes) = binary.iter_note_headers(bytes) else {
+        return Vec::new();
+    };
+    let mut properties = BTreeSet::new();
+    for note in notes {
+        match note {
+            Ok(note) if note.name == "GNU" && note.n_type == 5 => {
+                parse_gnu_property_desc(
+                    note.desc,
+                    binary.little_endian,
+                    binary.is_64,
+                    &mut properties,
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                warnings.push(format!("ELF GNU property parse failed: {error}"));
+                break;
+            }
+        }
+    }
+    properties.into_iter().collect()
+}
+
+fn parse_gnu_property_desc(
+    desc: &[u8],
+    little_endian: bool,
+    is_64: bool,
+    properties: &mut BTreeSet<String>,
+) {
+    const AARCH64_FEATURE_1_AND: u32 = 0xc000_0000;
+    const X86_FEATURE_1_AND: u32 = 0xc000_0002;
+    let alignment = if is_64 { 8 } else { 4 };
+    let mut offset = 0_usize;
+    while offset.checked_add(8).is_some_and(|end| end <= desc.len()) {
+        let property_type = read_u32(&desc[offset..offset + 4], little_endian);
+        let data_size = read_u32(&desc[offset + 4..offset + 8], little_endian) as usize;
+        offset += 8;
+        let Some(end) = offset.checked_add(data_size) else {
+            break;
+        };
+        let Some(data) = desc.get(offset..end) else {
+            break;
+        };
+        let flags = data
+            .get(..4)
+            .map(|value| read_u32(value, little_endian))
+            .unwrap_or_default();
+        match property_type {
+            X86_FEATURE_1_AND => {
+                if flags & 1 != 0 {
+                    properties.insert("x86_ibt".into());
+                }
+                if flags & 2 != 0 {
+                    properties.insert("x86_shadow_stack".into());
+                }
+            }
+            AARCH64_FEATURE_1_AND => {
+                if flags & 1 != 0 {
+                    properties.insert("aarch64_bti".into());
+                }
+                if flags & 2 != 0 {
+                    properties.insert("aarch64_pac".into());
+                }
+            }
+            _ => {}
+        }
+        offset = end.div_ceil(alignment) * alignment;
+    }
+}
+
+fn read_u32(bytes: &[u8], little_endian: bool) -> u32 {
+    let bytes = [bytes[0], bytes[1], bytes[2], bytes[3]];
+    if little_endian {
+        u32::from_le_bytes(bytes)
+    } else {
+        u32::from_be_bytes(bytes)
+    }
 }
 
 fn imports(binary: &Elf<'_>, limit: usize) -> Vec<BinaryImport> {
@@ -247,5 +362,33 @@ fn elf_architecture(machine: u16) -> String {
         183 => "aarch64".into(),
         243 => "riscv".into(),
         other => format!("machine_{other:#x}"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_x86_and_aarch64_gnu_feature_properties() {
+        let mut x86 = Vec::new();
+        x86.extend_from_slice(&0xc000_0002_u32.to_le_bytes());
+        x86.extend_from_slice(&4_u32.to_le_bytes());
+        x86.extend_from_slice(&3_u32.to_le_bytes());
+        x86.extend_from_slice(&[0; 4]);
+        let mut properties = BTreeSet::new();
+        parse_gnu_property_desc(&x86, true, true, &mut properties);
+        assert!(properties.contains("x86_ibt"));
+        assert!(properties.contains("x86_shadow_stack"));
+
+        let mut arm = Vec::new();
+        arm.extend_from_slice(&0xc000_0000_u32.to_be_bytes());
+        arm.extend_from_slice(&4_u32.to_be_bytes());
+        arm.extend_from_slice(&3_u32.to_be_bytes());
+        arm.extend_from_slice(&[0; 4]);
+        let mut properties = BTreeSet::new();
+        parse_gnu_property_desc(&arm, false, true, &mut properties);
+        assert!(properties.contains("aarch64_bti"));
+        assert!(properties.contains("aarch64_pac"));
     }
 }

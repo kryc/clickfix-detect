@@ -1,6 +1,6 @@
 [package]
 name = "cmd-emulator"
-version = "0.1.0"
+version.workspace = true
 license.workspace = true
 edition.workspace = true
 rust-version.workspace = true

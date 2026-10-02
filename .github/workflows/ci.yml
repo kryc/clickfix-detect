@@ -32,6 +32,9 @@ jobs:
       - name: Run tests
         run: cargo test --locked --workspace --all-targets
 
+      - name: Enforce hot-path performance thresholds
+        run: cargo run --locked --release -p clickfix-detect --example perf_gate
+
       - name: Check WebAssembly release build
         run: cargo check --locked -p clickfix-wasm --target wasm32-unknown-unknown --release
 

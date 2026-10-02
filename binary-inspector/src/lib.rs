@@ -1,3 +1,4 @@
+mod calibration;
 mod capabilities;
 mod elf;
 mod heuristics;
@@ -6,12 +7,18 @@ mod macho;
 mod model;
 mod pe;
 mod probe;
+mod signatures;
 mod strings;
 
+pub use calibration::{
+    calibrate, CalibrationClass, CalibrationFeature, CalibrationFrequency, CalibrationInput,
+    CalibrationReport, CalibrationSummary,
+};
 pub use limits::BinaryInspectionLimits;
 pub use model::{
     BinaryCapability, BinaryFormat, BinaryHardening, BinaryImport, BinaryIndicator,
     BinaryIndicatorKind, BinaryInspection, BinaryKind, BinarySection, InspectionStatus,
+    SignatureValidation, SignatureValidationStatus,
 };
 pub use probe::probe_format;
 

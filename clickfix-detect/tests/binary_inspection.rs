@@ -12,7 +12,7 @@ fn decoded_linux_binary_is_exposed_in_detector_report() {
         })
         .unwrap();
 
-    assert_eq!(REPORT_SCHEMA_VERSION, "5");
+    assert_eq!(REPORT_SCHEMA_VERSION, "6");
     assert_eq!(report.binary_inspections.len(), 1);
     assert_eq!(
         report.binary_inspections[0].inspection.format,

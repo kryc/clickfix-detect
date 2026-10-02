@@ -29,9 +29,11 @@ inputs are not hashed, tokenized, or emulated.
 emulation. Reports identify their `analysis_mode` and whether analysis was
 `prefilter_only`, `emulated`, or `partial`.
 
-The current report schema is version 5. It includes `binary_inspections`,
+The current report schema is version 6. It includes `binary_inspections`,
 typed `causal_edges`, and optional binary-inspection SHA-256 links on artifacts
-and virtual files. Function signatures and accepted input kinds are unchanged.
+and virtual files. Binary inspections now include signature-validation and ELF
+GNU-property results. Function signatures and accepted input kinds are
+unchanged.
 
 The prefilter also returns `oversized` for inputs above the detector's 1 MiB
 limit. Full reports include the same prefilter decision and signal list.

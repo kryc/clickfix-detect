@@ -4,14 +4,17 @@ use base64::Engine as _;
 use emulator_core::{
     ArtifactKind, CausalEdge, CausalEntity, CausalRelation, Engine, EventKind, Host, TraceEvent,
 };
+use flate2::read::GzDecoder;
 use std::collections::BTreeMap;
+use std::io::Read;
 
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) fn execute(
     emulator: &mut BashEmulator,
     name: &str,
     arguments: &[String],
     input: &[String],
+    raw_input: Option<&[u8]>,
     input_causes: &[CausalEntity],
     host: &mut dyn Host,
     depth: usize,
@@ -63,6 +66,16 @@ pub(crate) fn execute(
         "touch" => touch(emulator, arguments, host, depth)?,
         "cat" => cat(emulator, arguments, input, input_causes, host, depth),
         "base64" => base64_command(emulator, arguments, input, input_causes, host, depth),
+        "gzip" | "gunzip" => gzip_command(
+            emulator,
+            name,
+            arguments,
+            input,
+            raw_input,
+            input_causes,
+            host,
+            depth,
+        ),
         "ls" => ls(emulator, arguments, host, depth),
         "cp" => copy(emulator, arguments, host, depth)?,
         "mv" => move_file(emulator, arguments, host, depth)?,
@@ -87,6 +100,7 @@ pub(crate) fn execute(
                 nested,
                 arguments,
                 input,
+                raw_input,
                 input_causes,
                 host,
                 depth,
@@ -282,7 +296,16 @@ fn export(
     for argument in arguments {
         let argument = argument.trim_start_matches("-n");
         if let Some((name, value)) = argument.split_once('=') {
-            emulator.runtime.variables.insert(name.into(), value.into());
+            if let Some(values) = crate::parse_array_assignment_value(value) {
+                emulator.runtime.arrays.insert(name.into(), values.clone());
+                emulator
+                    .runtime
+                    .variables
+                    .insert(name.into(), values.first().cloned().unwrap_or_default());
+            } else {
+                emulator.runtime.arrays.remove(name);
+                emulator.runtime.variables.insert(name.into(), value.into());
+            }
             emulator.runtime.exported.insert(name.into());
             host.set_environment(name, value);
             host.emit(
@@ -311,6 +334,7 @@ fn export(
 fn unset(emulator: &mut BashEmulator, arguments: &[String], host: &mut dyn Host) -> CommandOutput {
     for name in arguments {
         emulator.runtime.variables.remove(name);
+        emulator.runtime.arrays.remove(name);
         emulator.runtime.exported.remove(name);
         emulator.runtime.functions.remove(name);
         host.remove_environment(name);
@@ -569,6 +593,7 @@ fn cat(
     }
 
     let mut output = CommandOutput::default();
+    let mut raw = Vec::new();
     for path in paths {
         let path = emulator.runtime.resolve_path(path);
         let Some(bytes) = host.read_file(&path, Engine::Bash, depth) else {
@@ -579,12 +604,14 @@ fn cat(
         output
             .stdout
             .extend(String::from_utf8_lossy(&bytes).lines().map(str::to_owned));
+        raw.extend_from_slice(&bytes);
         output
             .causes
             .push(CausalEntity::VirtualFile { path: path.clone() });
     }
     output.causes.sort();
     output.causes.dedup();
+    output.raw_stdout = Some(raw);
     output
 }
 
@@ -656,6 +683,93 @@ fn base64_command(
             .collect(),
         raw_stdout: Some(decoded),
         causes: vec![artifact],
+        ..CommandOutput::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn gzip_command(
+    emulator: &BashEmulator,
+    name: &str,
+    arguments: &[String],
+    input: &[String],
+    raw_input: Option<&[u8]>,
+    input_causes: &[CausalEntity],
+    host: &mut dyn Host,
+    depth: usize,
+) -> CommandOutput {
+    let decode = arguments
+        .iter()
+        .any(|argument| matches!(argument.as_str(), "-d" | "-dc" | "-cd" | "--decompress"))
+        || name == "gunzip";
+    if !decode {
+        return failure("gzip: compression mode is not modeled; use -d for decompression");
+    }
+    let file = arguments.iter().find(|argument| !argument.starts_with('-'));
+    let (compressed, mut causes) = if let Some(path) = file {
+        let path = emulator.runtime.resolve_path(path);
+        let Some(bytes) = host.read_file(&path, Engine::Bash, depth) else {
+            return failure(format!("gzip: {path}: No such file or directory"));
+        };
+        (bytes, vec![CausalEntity::VirtualFile { path }])
+    } else if let Some(raw_input) = raw_input {
+        (raw_input.to_vec(), input_causes.to_vec())
+    } else {
+        (input.join("\n").into_bytes(), input_causes.to_vec())
+    };
+    let mut decoded = Vec::new();
+    let limit = host.limits().max_artifact_bytes;
+    match GzDecoder::new(compressed.as_slice())
+        .take(limit.saturating_add(1) as u64)
+        .read_to_end(&mut decoded)
+    {
+        Ok(_) if decoded.len() <= limit => {}
+        Ok(_) => {
+            host.warning(format!(
+                "gzip output exceeded the {limit}-byte artifact limit"
+            ));
+            return failure("gzip: decompressed output exceeded analysis limits");
+        }
+        Err(error) => return failure(format!("gzip: invalid compressed data: {error}")),
+    }
+    let artifact_id = host.add_artifact(
+        if std::str::from_utf8(&decoded).is_ok() {
+            ArtifactKind::DecodedText
+        } else {
+            ArtifactKind::Binary
+        },
+        "gzip-decoded",
+        "application/octet-stream",
+        &decoded,
+        depth,
+    );
+    let artifact = CausalEntity::Artifact { id: artifact_id };
+    for source in &causes {
+        host.add_causal_edge(CausalEdge {
+            from: source.clone(),
+            to: artifact.clone(),
+            relation: CausalRelation::Decoded,
+            depth,
+        });
+    }
+    causes.clear();
+    causes.push(artifact);
+    host.emit(
+        TraceEvent::new(
+            depth,
+            Engine::Bash,
+            EventKind::Decode,
+            "decompressed GZip with Bash gzip builtin",
+        )
+        .with_data("decoded_bytes", decoded.len().to_string()),
+    );
+    CommandOutput {
+        stdout: String::from_utf8_lossy(&decoded)
+            .lines()
+            .map(str::to_owned)
+            .collect(),
+        raw_stdout: Some(decoded),
+        causes,
         ..CommandOutput::default()
     }
 }
@@ -1041,7 +1155,7 @@ fn env(
         index += 1;
     }
     if let Some((command, rest)) = arguments[index..].split_first() {
-        if let Some(output) = execute(emulator, command, rest, &[], &[], host, depth)? {
+        if let Some(output) = execute(emulator, command, rest, &[], None, &[], host, depth)? {
             return Ok(output);
         }
         return emulator.execute_external(command, rest, Vec::new(), Vec::new(), host, depth);
@@ -1116,6 +1230,8 @@ fn is_builtin(name: &str) -> bool {
             | "["
             | "read"
             | "base64"
+            | "gzip"
+            | "gunzip"
             | "ls"
             | "source"
             | "."

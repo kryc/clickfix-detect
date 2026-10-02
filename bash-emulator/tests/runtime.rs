@@ -1,5 +1,7 @@
 use bash_emulator::BashEmulator;
-use emulator_core::{AnalysisLimits, EventKind, VirtualHost};
+use emulator_core::{AnalysisLimits, EventKind, Host, VirtualHost};
+use flate2::{write::GzEncoder, Compression};
+use std::io::Write;
 
 #[test]
 fn functions_loops_conditionals_and_redirection_work_together() {
@@ -162,4 +164,81 @@ fn heredocs_supply_stdin_with_expansion_and_quoted_delimiters() {
         .unwrap();
 
     assert_eq!(result.stdout, ["hello world", "literal $name", "indented"]);
+}
+
+#[test]
+fn arrays_ifs_and_virtual_globs_expand_deterministically() {
+    let mut host = VirtualHost::linux(AnalysisLimits::default());
+    let mut emulator = BashEmulator::new();
+    let result = emulator
+        .emulate(
+            r#"
+values=(one "two words" three)
+for value in "${values[@]}"; do echo "array:$value"; done
+echo "count:${#values[@]}"
+IFS=,
+for value in alpha,beta; do echo "ifs:$value"; done
+touch /tmp/b.txt /tmp/a.txt /tmp/ignored.bin
+for path in /tmp/*.txt; do echo "glob:$path"; done
+"#,
+            &mut host,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(
+        result.stdout,
+        [
+            "array:one",
+            "array:two words",
+            "array:three",
+            "count:3",
+            "ifs:alpha",
+            "ifs:beta",
+            "glob:/tmp/a.txt",
+            "glob:/tmp/b.txt",
+        ]
+    );
+}
+
+#[test]
+fn output_process_substitution_consumes_virtual_output() {
+    let mut host = VirtualHost::linux(AnalysisLimits::default());
+    let mut emulator = BashEmulator::new();
+    let result = emulator
+        .emulate(
+            "echo captured > >(cat > /tmp/captured); cat /tmp/captured",
+            &mut host,
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(result.stdout, ["captured"]);
+}
+
+#[test]
+fn gzip_builtin_preserves_binary_input_and_emits_decoded_text() {
+    let mut encoder = GzEncoder::new(Vec::new(), Compression::default());
+    encoder.write_all(b"echo gzip-stage\n").unwrap();
+    let compressed = encoder.finish().unwrap();
+    let mut host = VirtualHost::linux(AnalysisLimits::default());
+    host.write_file(
+        "/tmp/stage.gz",
+        &compressed,
+        false,
+        emulator_core::Engine::Bash,
+        0,
+    )
+    .unwrap();
+    let mut emulator = BashEmulator::new();
+    let result = emulator
+        .emulate("cat /tmp/stage.gz | gzip -dc", &mut host, 0)
+        .unwrap();
+
+    assert_eq!(result.stdout, ["echo gzip-stage"]);
+    assert!(host
+        .snapshot()
+        .trace
+        .iter()
+        .any(|event| event.kind == EventKind::Decode && event.message.contains("GZip")));
 }

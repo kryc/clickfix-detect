@@ -1,0 +1,89 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install 1.85.1 --profile minimal \
+            --target wasm32-unknown-unknown
+          rustup default 1.85.1
+
+      - name: Verify tag matches workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(cargo metadata --no-deps --format-version 1 | python -c 'import json,sys; data=json.load(sys.stdin); print(next(p["version"] for p in data["packages"] if p["name"] == "clickfix-detect"))')"
+          test "v${version}" = "${GITHUB_REF_NAME}"
+
+      - name: Test release revision
+        run: cargo test --locked --workspace --all-targets
+
+      - name: Build native binaries
+        run: |
+          cargo build --locked --release \
+            -p clickfix-detect \
+            -p runbox-emulator \
+            -p bash-emulator \
+            -p cmd-emulator \
+            -p powershell-emulator \
+            -p windows-script-emulator
+
+      - name: Install wasm-bindgen CLI
+        run: |
+          curl -fsSL \
+            https://github.com/wasm-bindgen/wasm-bindgen/releases/download/0.2.117/wasm-bindgen-0.2.117-x86_64-unknown-linux-musl.tar.gz \
+            -o wasm-bindgen.tar.gz
+          echo "97f527f7c7956f69a88a4bdb5176142ebc4e255c2dbe3805ec4f373421028240  wasm-bindgen.tar.gz" \
+            | sha256sum -c -
+          mkdir wasm-bindgen
+          tar -xzf wasm-bindgen.tar.gz -C wasm-bindgen --strip-components=1
+          echo "${{ github.workspace }}/wasm-bindgen" >> "$GITHUB_PATH"
+
+      - name: Build WebAssembly package
+        run: |
+          cargo build --locked --release -p clickfix-wasm --target wasm32-unknown-unknown
+          mkdir -p dist/wasm
+          wasm-bindgen \
+            --target web \
+            --out-dir dist/wasm \
+            target/wasm32-unknown-unknown/release/clickfix_wasm.wasm
+
+      - name: Package release artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist/native
+          cp target/release/clickfix-detect dist/native/
+          cp target/release/runbox-emulator dist/native/
+          cp target/release/bash-emulator dist/native/
+          cp target/release/cmd-emulator dist/native/
+          cp target/release/powershell-emulator dist/native/
+          cp target/release/windows-script-emulator dist/native/
+          tar -C dist/native -czf "dist/clickfix-detect-${GITHUB_REF_NAME}-linux-x86_64.tar.gz" .
+          tar -C dist/wasm -czf "dist/clickfix-detect-${GITHUB_REF_NAME}-wasm-web.tar.gz" .
+          sha256sum dist/*.tar.gz > dist/SHA256SUMS
+
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            dist/*.tar.gz \
+            dist/SHA256SUMS \
+            --generate-notes \
+            --title "${GITHUB_REF_NAME}"

@@ -19,8 +19,15 @@ before submitting a pull request:
 cargo fmt --all -- --check
 cargo clippy --locked --workspace --all-targets -- -D warnings
 cargo test --locked --workspace --all-targets
+cargo run --locked --release -p clickfix-detect --example perf_gate
 cargo check --locked -p clickfix-wasm --target wasm32-unknown-unknown --release
 cargo audit
+```
+
+Run the Criterion benchmark when changing prefilter or detector hot paths:
+
+```console
+cargo bench --locked -p clickfix-detect --bench hot_path
 ```
 
 Compile any affected fuzz package, for example:
@@ -40,6 +47,8 @@ cargo check --locked --manifest-path binary-inspector/fuzz/Cargo.toml --bins
 - Keep source-attributed fixtures defanged and document whether they are
   complete, reconstructed, representative, or truncated.
 - Update report-schema documentation when serialized fields change.
+- Keep binary calibration metrics non-scoring until representative corpora
+  establish acceptable false-positive and detection rates.
 
 Security-sensitive reports should follow [SECURITY.md](SECURITY.md), not the
 public issue tracker.

@@ -11,7 +11,7 @@ use std::sync::LazyLock;
 use thiserror::Error;
 use url::Url;
 
-pub const REPORT_SCHEMA_VERSION: &str = "5";
+pub const REPORT_SCHEMA_VERSION: &str = "6";
 pub const MAX_DETECTOR_INPUT_BYTES: usize = 1024 * 1024;
 pub const DEFAULT_SAFE_SOURCE_URLS: &[&str] = &["https://gh.io/copilot-install"];
 

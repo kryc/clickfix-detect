@@ -17,10 +17,11 @@ Supported language surfaces include:
 - command lists, `&&`, `||`, pipelines, groups, subshells, functions, `if`,
   `for`, C-style arithmetic `for`, `while`, and `until`;
 - assignments, exported variables, shell functions, positional arguments,
+  indexed arrays, IFS field splitting, virtual wildcard expansion,
   return/exit/break/continue flow, and bounded loops;
 - stdin/stdout/stderr pipelines, expandable and quoted heredocs, `<<-` tab
-  stripping, and file redirection, including binary-safe `base64 -d > file`
-  output;
+  stripping, input and output process substitution, and file redirection,
+  including binary-safe Base64 and GZip decode pipelines;
 - common builtins and virtual filesystem operations, including deterministic
   `ls`, `ls -a`/`-A`, `ls -l`, and explicit file or directory arguments.
 

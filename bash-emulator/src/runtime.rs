@@ -19,6 +19,7 @@ impl Default for FlowControl {
 #[derive(Debug, Clone)]
 pub(crate) struct Runtime {
     pub variables: BTreeMap<String, String>,
+    pub arrays: BTreeMap<String, Vec<String>>,
     pub exported: BTreeSet<String>,
     pub functions: BTreeMap<String, Command>,
     pub positional: Vec<String>,
@@ -29,6 +30,7 @@ pub(crate) struct Runtime {
     pub flow: FlowControl,
     pub pid: u32,
     pub temporary_file_counter: usize,
+    pub output_process_substitutions: BTreeMap<String, String>,
     pub initialized_from_host: bool,
 }
 
@@ -36,6 +38,7 @@ impl Default for Runtime {
     fn default() -> Self {
         Self {
             variables: BTreeMap::new(),
+            arrays: BTreeMap::new(),
             exported: BTreeSet::new(),
             functions: BTreeMap::new(),
             positional: Vec::new(),
@@ -46,6 +49,7 @@ impl Default for Runtime {
             flow: FlowControl::None,
             pid: 4_242,
             temporary_file_counter: 0,
+            output_process_substitutions: BTreeMap::new(),
             initialized_from_host: false,
         }
     }
@@ -69,6 +73,18 @@ impl Runtime {
     }
 
     pub(crate) fn variable(&self, name: &str, environment: Option<&str>) -> String {
+        if let Some((array, index)) = parse_array_reference(name) {
+            let values = self.arrays.get(array).cloned().unwrap_or_default();
+            return match index {
+                "@" | "*" => values.join(" "),
+                index => index
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|index| values.get(index))
+                    .cloned()
+                    .unwrap_or_default(),
+            };
+        }
         match name {
             "?" => self.last_status.to_string(),
             "$" => self.pid.to_string(),
@@ -87,8 +103,20 @@ impl Runtime {
                 .variables
                 .get(name)
                 .cloned()
+                .or_else(|| {
+                    self.arrays
+                        .get(name)
+                        .and_then(|values| values.first())
+                        .cloned()
+                })
                 .or_else(|| environment.map(str::to_owned))
                 .unwrap_or_default(),
         }
     }
+}
+
+fn parse_array_reference(name: &str) -> Option<(&str, &str)> {
+    let open = name.find('[')?;
+    let close = name.strip_suffix(']')?;
+    Some((&name[..open], &close[open + 1..]))
 }

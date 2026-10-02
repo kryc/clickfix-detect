@@ -123,8 +123,9 @@ before hashing.
   positional parameters, command and arithmetic substitution; command lists,
   pipelines, functions, groups, subshells, `if`, `for`, C-style arithmetic
   `for`, `while`, and `until`; expandable and quoted heredocs;
-  virtual POSIX files and directories; binary-safe Base64 decoding and common
-  shell/file/text builtins including `ls`; typed external process intents;
+  indexed arrays, IFS splitting, virtual globbing, input/output process
+  substitution, virtual POSIX files and directories, binary-safe Base64 and
+  GZip decoding, and common shell/file/text builtins including `ls`; typed external process intents;
   `bash`, `sh`, and `zsh` dispatch; and modeled
   `osascript`, `launchctl`, `open`, `chmod`, `xattr`, `spctl`, `defaults`, and
   `scutil` behavior.
@@ -137,10 +138,17 @@ Unsupported operations are always traced explicitly. The project does not
 claim complete Windows PowerShell, JScript, VBScript, COM, DOM, or Win32
 compatibility yet.
 
-Report schema version 5 includes typed causal edges between network activity,
+Report schema version 6 includes typed causal edges between network activity,
 artifacts, virtual files, extraction and decode operations, executable marking,
-and modeled process launches. Detection uses those edges for staged-execution
-and safe-source correlation instead of relying on trace order.
+and modeled process launches, plus binary signature-validation and ELF GNU
+property metadata. Detection uses causal edges for staged-execution and
+safe-source correlation instead of relying on trace order.
+
+Native binary reports distinguish content-digest integrity, CMS signer
+cryptography, and certificate-chain trust. The first two are validated where
+bounded cross-platform support exists; trust-chain validation remains `null`
+unless a caller provides an explicit trust policy. Binary heuristic calibration
+is reported separately and does not affect verdict scores.
 
 ## CLI
 
@@ -506,6 +514,11 @@ executables, environment variables, registry values, and exact network
 fixtures. `Detector::with_network_policy` and `Runbox::with_network_policy`
 provide the same opt-in policy at higher layers.
 
+When real HTTP(S) retrieval is enabled, each redirect hop is resolved once,
+checked against the public-address policy, and the resulting socket-address set
+is pinned into the HTTP client's resolver. The connection therefore cannot
+silently use a different DNS answer after validation.
+
 Safe sources are independently configurable:
 
 ```rust
@@ -553,7 +566,13 @@ evaluating the source.
 cargo fmt --all --check
 cargo test --workspace
 cargo clippy --workspace --all-targets -- -D warnings
+cargo run --release -p clickfix-detect --example perf_gate
+cargo bench -p clickfix-detect --bench hot_path
 ```
+
+Pushing a `v<workspace-version>` tag runs the release workflow, verifies the
+tag against Cargo metadata, tests the revision, and publishes Linux CLI and
+web-WASM archives with SHA-256 checksums.
 
 ### Fuzzing
 

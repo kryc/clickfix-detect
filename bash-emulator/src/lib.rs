@@ -59,6 +59,7 @@ pub enum BashError {
 pub struct BashEmulator {
     runtime: Runtime,
     pipe_input: Option<Vec<String>>,
+    pipe_raw_input: Option<Vec<u8>>,
     pipe_causes: Vec<CausalEntity>,
 }
 
@@ -272,13 +273,18 @@ impl BashEmulator {
         depth: usize,
     ) -> Result<CommandOutput, BashError> {
         let previous_input = self.pipe_input.take();
+        let previous_raw_input = self.pipe_raw_input.take();
         let previous_causes = std::mem::take(&mut self.pipe_causes);
+        self.pipe_input.clone_from(&previous_input);
+        self.pipe_raw_input.clone_from(&previous_raw_input);
+        self.pipe_causes.clone_from(&previous_causes);
         let mut aggregate_stderr = Vec::new();
         let mut output = CommandOutput::default();
         for (index, command) in pipeline.commands.iter().enumerate() {
             output = if pipeline.commands.len() > 1 {
                 let mut stage = self.clone();
                 stage.pipe_input = self.pipe_input.take();
+                stage.pipe_raw_input = self.pipe_raw_input.take();
                 stage.pipe_causes = std::mem::take(&mut self.pipe_causes);
                 stage.execute_command(document, command, host, depth)?
             } else {
@@ -287,11 +293,12 @@ impl BashEmulator {
             aggregate_stderr.append(&mut output.stderr);
             if index + 1 < pipeline.commands.len() {
                 self.pipe_input = Some(std::mem::take(&mut output.stdout));
+                self.pipe_raw_input = output.raw_stdout.take();
                 self.pipe_causes = std::mem::take(&mut output.causes);
-                output.raw_stdout = None;
             }
         }
         self.pipe_input = previous_input;
+        self.pipe_raw_input = previous_raw_input;
         self.pipe_causes = previous_causes;
         output.stderr = aggregate_stderr;
         if pipeline.negated {
@@ -566,6 +573,7 @@ impl BashEmulator {
         Ok(result)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn execute_simple(
         &mut self,
         document: &ParsedDocument,
@@ -580,9 +588,20 @@ impl BashEmulator {
         let mut assignment_count = 0;
         for word in &words {
             if let Some((name, value)) = parse_assignment(word) {
-                self.runtime.variables.insert(name.into(), value.into());
+                if let Some(values) = parse_array_assignment_value(value) {
+                    self.runtime.arrays.insert(name.into(), values.clone());
+                    self.runtime
+                        .variables
+                        .insert(name.into(), values.first().cloned().unwrap_or_default());
+                } else {
+                    self.runtime.arrays.remove(name);
+                    self.runtime.variables.insert(name.into(), value.into());
+                }
                 if self.runtime.exported.contains(name) {
-                    host.set_environment(name, value);
+                    host.set_environment(
+                        name,
+                        self.runtime.variables.get(name).map_or("", String::as_str),
+                    );
                 }
                 host.emit(
                     TraceEvent::new(
@@ -600,6 +619,7 @@ impl BashEmulator {
         }
         let arguments = &words[assignment_count..];
         let mut input = self.pipe_input.take().unwrap_or_default();
+        let raw_input = self.pipe_raw_input.take();
         let input_causes = std::mem::take(&mut self.pipe_causes);
         self.apply_input_redirections(document, &command.redirections, &mut input, host, depth)?;
         let mut output = if let Some((name, arguments)) = arguments.split_first() {
@@ -627,9 +647,16 @@ impl BashEmulator {
                 }
                 self.runtime.positional = previous;
                 output
-            } else if let Some(output) =
-                builtins::execute(self, name, arguments, &input, &input_causes, host, depth)?
-            {
+            } else if let Some(output) = builtins::execute(
+                self,
+                name,
+                arguments,
+                &input,
+                raw_input.as_deref(),
+                &input_causes,
+                host,
+                depth,
+            )? {
                 output
             } else {
                 self.execute_external(name, arguments, input, input_causes, host, depth)?
@@ -638,6 +665,7 @@ impl BashEmulator {
             CommandOutput::default()
         };
         self.apply_output_redirections(document, &command.redirections, &mut output, host, depth)?;
+        self.flush_output_process_substitutions(&mut output, host, depth)?;
         for line in &output.stdout {
             host.emit(
                 TraceEvent::new(depth, Engine::Bash, EventKind::Output, line.clone())
@@ -654,6 +682,37 @@ impl BashEmulator {
         }
         self.pipe_input = None;
         Ok(output)
+    }
+
+    fn flush_output_process_substitutions(
+        &mut self,
+        output: &mut CommandOutput,
+        host: &mut dyn Host,
+        depth: usize,
+    ) -> Result<(), BashError> {
+        let substitutions = std::mem::take(&mut self.runtime.output_process_substitutions);
+        for (path, command) in substitutions {
+            let bytes = host
+                .read_file(&path, Engine::Bash, depth)
+                .unwrap_or_default();
+            let mut nested = self.clone();
+            nested.pipe_input = Some(
+                String::from_utf8_lossy(&bytes)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect(),
+            );
+            nested.pipe_raw_input = Some(bytes);
+            nested.pipe_causes = vec![CausalEntity::VirtualFile { path }];
+            let mut result = nested.execute_source(&command, host, depth + 1)?;
+            output.stdout.append(&mut result.stdout);
+            output.stderr.append(&mut result.stderr);
+            output.causes.append(&mut result.causes);
+            output.code = result.code;
+        }
+        output.causes.sort();
+        output.causes.dedup();
+        Ok(())
     }
 
     fn apply_input_redirections(
@@ -880,7 +939,15 @@ fn parse_assignment(word: &str) -> Option<(&str, &str)> {
     {
         return None;
     }
+
     Some((name, value))
+}
+
+pub(crate) fn parse_array_assignment_value(value: &str) -> Option<Vec<String>> {
+    value
+        .strip_prefix('(')
+        .and_then(|value| value.strip_suffix(')'))
+        .map(split_condition_words)
 }
 
 fn quote_shell(value: &str) -> String {
@@ -892,7 +959,7 @@ fn quote_shell(value: &str) -> String {
     }
 }
 
-fn shell_pattern_matches(value: &str, pattern: &str) -> bool {
+pub(crate) fn shell_pattern_matches(value: &str, pattern: &str) -> bool {
     fn matches_bytes(value: &[u8], pattern: &[u8]) -> bool {
         match pattern {
             [] => value.is_empty(),
